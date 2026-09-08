@@ -69,6 +69,41 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 
 본문은 serializer로 직렬화한 Channels 메시지 dict다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
 
+## Windows 운영
+
+`nats-server.exe` 하나가 전부다. Windows 서비스로 올리는 방법.
+
+1. [릴리스 zip](https://github.com/nats-io/nats-server/releases)을 `C:\nats\`에 푼다.
+2. 설정 파일 `C:\nats\nats.conf`를 만든다. 외부에 열지 않고 토큰을 요구하는 최소 구성이다.
+
+   ```
+   listen: 127.0.0.1:4222
+   authorization { token: "긴-무작위-문자열" }
+   log_file: "C:\nats\nats.log"
+   ```
+
+3. 서비스로 등록하고 시작한다 (관리자 PowerShell). nats-server는 Windows 서비스 제어를 직접 지원한다.
+
+   ```powershell
+   sc.exe create nats-server binPath= "C:\nats\nats-server.exe -c C:\nats\nats.conf" start= auto
+   sc.exe start nats-server
+   ```
+
+4. Django 쪽은 URL에 토큰을 넣는다.
+
+   ```python
+   CHANNEL_LAYERS = {
+       "default": {
+           "BACKEND": "channels_nats.NatsChannelLayer",
+           "CONFIG": {"servers": [f"nats://{os.environ['NATS_TOKEN']}@127.0.0.1:4222"]},
+       }
+   }
+   ```
+
+여러 Python 프로세스(daphne 등)는 같은 URL로 붙으면 한 레이어를 공유한다. SQLite를 쓰는 단일 서버라면 이것으로 멀티프로세스 구성이 끝난다. 상태 확인은 `sc.exe query nats-server`, 로그는 `nats.log`, 재시작은 `sc.exe stop`과 `start`다.
+
+macOS와 Linux에서는 `brew services start nats-server` 또는 systemd 유닛에 같은 설정 파일을 쓴다.
+
 ## 벤치마크
 
 `make bench`가 프로세스 P개에 멤버 채널 N개를 나눠 구독시키고 `group_send`를 M회 발행해, 발행에서 각 멤버의 `receive`까지의 지연과 처리량을 잰다. 결과는 `bench/results/`에 남는다. 아래는 macOS arm64, Python 3.12, nats-server 2.14.6에서 잰 값이다 (2026-09-08).
