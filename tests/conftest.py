@@ -169,8 +169,5 @@ async def make_layer(nats_url):
 
     yield factory
     for instance in created:
-        try:  # a test may have taken the node this layer was talking to down
-            await instance.flush()
-        except Exception:
-            pass
+        await instance.flush()
         await instance.close()

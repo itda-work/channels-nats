@@ -200,6 +200,25 @@ def test_state_of_a_closed_loop_is_forgotten():
     assert len(layer._states) == 1  # only the newest; its own successor will sweep it
 
 
+async def test_flush_survives_a_connection_that_is_already_gone(make_layer):
+    """Shutting down while NATS is unreachable must not turn into an error."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    await worker.group_add("room", channel)
+    receiving = asyncio.create_task(worker.receive("plain"))
+    await asyncio.sleep(0.1)
+
+    await worker._state().client.close()
+    await worker.flush()
+
+    state = worker._state()
+    assert not state.mailboxes and not state.groups and not state.group_subscriptions
+    assert not state.process_subscriptions
+    receiving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receiving
+
+
 async def test_invalid_names_are_rejected(layer):
     with pytest.raises(TypeError):
         await layer.group_send("bad*name", {"type": "x"})

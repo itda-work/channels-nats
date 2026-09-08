@@ -212,6 +212,18 @@ class NatsChannelLayer(BaseChannelLayer):
 
         return deliver
 
+    async def _unsubscribe(self, subscriptions: t.Iterable[Subscription]) -> None:
+        """Drop subscriptions, tolerating a connection that has already gone.
+
+        Every caller has finished its bookkeeping by now, so a connection that
+        died must not turn tearing down into an error.
+        """
+        for subscription in subscriptions:
+            try:
+                await subscription.unsubscribe()
+            except Exception as error:
+                log.debug("channels_nats: could not unsubscribe: %s", error)
+
     def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
         now = time.monotonic()
         if box.queue.qsize() >= self.get_capacity(channel):
@@ -331,11 +343,7 @@ class NatsChannelLayer(BaseChannelLayer):
                     stale.append(subscription)
         # The bookkeeping above is done before the first await, so a second
         # cancellation cannot leave this half applied.
-        for subscription in stale:
-            try:
-                await subscription.unsubscribe()
-            except Exception as error:  # the connection may already be gone
-                log.debug("channels_nats: could not unsubscribe %s: %s", channel, error)
+        await self._unsubscribe(stale)
 
     async def new_channel(self, prefix: str = "specific") -> str:
         channel = f"{prefix}.{self.client_id}!{uuid.uuid4().hex}"
@@ -369,7 +377,7 @@ class NatsChannelLayer(BaseChannelLayer):
             del state.groups[group]
             subscription = state.group_subscriptions.pop(group, None)
             if subscription is not None:
-                await subscription.unsubscribe()
+                await self._unsubscribe([subscription])
 
     async def group_send(self, group: str, message: Message) -> None:
         assert isinstance(message, dict), "message is not a dict"
@@ -382,17 +390,16 @@ class NatsChannelLayer(BaseChannelLayer):
     async def flush(self) -> None:
         """Drop this process's subscriptions, mailboxes and group memberships."""
         state = self._state()
-        for subscription in list(state.group_subscriptions.values()):
-            await subscription.unsubscribe()
-        for box in list(state.mailboxes.values()):
-            if box.subscription is not None:
-                await box.subscription.unsubscribe()
-        for subscription in list(state.process_subscriptions.values()):
-            await subscription.unsubscribe()
+        stale = [
+            *state.group_subscriptions.values(),
+            *(box.subscription for box in state.mailboxes.values() if box.subscription is not None),
+            *state.process_subscriptions.values(),
+        ]
         state.group_subscriptions.clear()
         state.process_subscriptions.clear()
         state.mailboxes.clear()
         state.groups.clear()
+        await self._unsubscribe(stale)
 
     async def close(self) -> None:
         """Close the connection owned by the current event loop."""
