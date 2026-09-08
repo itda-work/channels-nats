@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # Pinned exactly: setup-uv dropped its floating major tags in v8.
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: Check the version, the CHANGELOG and the classifiers agree
         run: python3 scripts/release_check.py "$GITHUB_REF_NAME"

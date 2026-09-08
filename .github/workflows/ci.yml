@@ -18,7 +18,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # Pinned exactly: setup-uv dropped its floating major tags in v8.
+      - uses: astral-sh/setup-uv@v10.0.1
       - run: uv python install ${{ matrix.python-version }}
 
       - name: Install nats-server (Linux)
