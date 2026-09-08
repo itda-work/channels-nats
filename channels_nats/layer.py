@@ -22,6 +22,11 @@ Semantics follow the Channels layer spec on an at-most-once transport:
 - Messages published before a channel's first ``receive()`` (or ``new_channel()``)
   are lost: there is no subscriber yet. Consumers always subscribe on connect,
   so this only matters for ad-hoc channel names.
+- A mailbox lives until its last ``receive()`` is cancelled, which is how a
+  consumer's disconnect reaches the layer; then the mailbox and, for a plain
+  channel, its subscription go away.
+- If nats-py gives up reconnecting and closes the client, the next call opens a
+  new connection and restores this loop's subscriptions on it.
 
 Connections are per event loop, so ``async_to_sync(layer.group_send)`` from
 Django signals or views works alongside the consumers' loop.
@@ -52,6 +57,7 @@ Message = dict[str, t.Any]
 class _Mailbox:
     queue: asyncio.Queue[tuple[float, Message]]
     subscription: Subscription | None = None
+    receivers: int = 0
 
 
 @dataclass
@@ -115,8 +121,38 @@ class NatsChannelLayer(BaseChannelLayer):
         if state.client is None or state.client.is_closed:
             async with state.lock:
                 if state.client is None or state.client.is_closed:
+                    stale = state.client is not None
                     state.client = await nats.connect(servers=self.servers, **self.connect_options)
+                    if stale:
+                        await self._resubscribe(state, state.client)
         return state.client
+
+    async def _resubscribe(self, state: _LoopState, client: Client) -> None:
+        """Rebuild every subscription of this loop on a fresh connection.
+
+        nats-py restores subscriptions across its own reconnects, but once it has
+        spent ``max_reconnect_attempts`` it closes the client for good. The
+        connection opened after that is new and knows nothing about them, so
+        without this the process would keep publishing while receiving nothing.
+        """
+        for subject in list(state.process_subscriptions):
+            state.process_subscriptions[subject] = await client.subscribe(subject, cb=self._process_deliver(state))
+        for channel, box in state.mailboxes.items():
+            if box.subscription is not None:
+                box.subscription = await client.subscribe(
+                    self.channel_subject(channel), cb=self._channel_deliver(box, channel)
+                )
+        for group in list(state.group_subscriptions):
+            state.group_subscriptions[group] = await client.subscribe(
+                self.group_subject(group), cb=self._group_deliver(state, group)
+            )
+        await client.flush()
+        log.warning(
+            "channels_nats: the NATS connection was closed; reconnected and restored %d subscriptions",
+            len(state.process_subscriptions)
+            + len(state.group_subscriptions)
+            + sum(1 for box in state.mailboxes.values() if box.subscription is not None),
+        )
 
     CHANNEL_HEADER = "Channel"
 
@@ -132,6 +168,33 @@ class NatsChannelLayer(BaseChannelLayer):
 
     def group_subject(self, group: str) -> str:
         return f"{self.prefix}.grp.{group}"
+
+    def _channel_deliver(self, box: _Mailbox, channel: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
+        async def deliver(msg: t.Any) -> None:
+            self._enqueue(box, channel, self.serializer.loads(msg.data))
+
+        return deliver
+
+    def _process_deliver(self, state: _LoopState) -> t.Callable[[t.Any], t.Awaitable[None]]:
+        async def deliver(msg: t.Any) -> None:
+            target = (msg.headers or {}).get(self.CHANNEL_HEADER)
+            if not isinstance(target, str):
+                return
+            box = state.mailboxes.get(target)
+            if box is not None:
+                self._enqueue(box, target, self.serializer.loads(msg.data))
+
+        return deliver
+
+    def _group_deliver(self, state: _LoopState, group: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
+        async def deliver(msg: t.Any) -> None:
+            message = self.serializer.loads(msg.data)
+            for member in list(state.groups.get(group, ())):
+                box = state.mailboxes.get(member)
+                if box is not None:
+                    self._enqueue(box, member, message)
+
+        return deliver
 
     def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
         if box.queue.qsize() >= self.get_capacity(channel):
@@ -150,16 +213,19 @@ class NatsChannelLayer(BaseChannelLayer):
         if box is None:
             box = _Mailbox(queue=asyncio.Queue())
             state.mailboxes[channel] = box
-            if "!" in channel:
-                await self._process_subscription(channel)
-            else:
-                client = await self._client()
-
-                async def deliver(msg: t.Any) -> None:
-                    self._enqueue(box, channel, self.serializer.loads(msg.data))
-
-                box.subscription = await client.subscribe(self.channel_subject(channel), cb=deliver)
-                await client.flush()  # the server knows about the subscription before we return
+            try:
+                if "!" in channel:
+                    await self._process_subscription(channel)
+                else:
+                    client = await self._client()
+                    box.subscription = await client.subscribe(
+                        self.channel_subject(channel), cb=self._channel_deliver(box, channel)
+                    )
+                    await client.flush()  # the server knows about the subscription before we return
+            except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
+                if state.mailboxes.get(channel) is box:
+                    del state.mailboxes[channel]
+                raise
         return box
 
     async def _process_subscription(self, channel: str) -> None:
@@ -169,16 +235,7 @@ class NatsChannelLayer(BaseChannelLayer):
         if subject in state.process_subscriptions:
             return
         client = await self._client()
-
-        async def deliver(msg: t.Any) -> None:
-            target = (msg.headers or {}).get(self.CHANNEL_HEADER)
-            if not isinstance(target, str):
-                return
-            box = state.mailboxes.get(target)
-            if box is not None:
-                self._enqueue(box, target, self.serializer.loads(msg.data))
-
-        state.process_subscriptions[subject] = await client.subscribe(subject, cb=deliver)
+        state.process_subscriptions[subject] = await client.subscribe(subject, cb=self._process_deliver(state))
         await client.flush()
 
     # ------------------------------------------------------------------ channels
@@ -194,11 +251,51 @@ class NatsChannelLayer(BaseChannelLayer):
     async def receive(self, channel: str) -> Message:
         self.require_valid_channel_name(channel)
         box = await self._mailbox(channel)
-        while True:
-            queued_at, message = await box.queue.get()
-            if time.monotonic() - queued_at > self.expiry:
-                continue
-            return message
+        box.receivers += 1
+        cancelled = False
+        try:
+            while True:
+                queued_at, message = await box.queue.get()
+                if time.monotonic() - queued_at > self.expiry:
+                    continue
+                return message
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            box.receivers -= 1
+            if cancelled and box.receivers == 0:
+                await self._discard_mailbox(channel, box)
+
+    async def _discard_mailbox(self, channel: str, box: _Mailbox) -> None:
+        """Forget a channel whose last receiver was cancelled.
+
+        A consumer that goes away leaves its pending ``receive()`` cancelled, and
+        that is the only signal the Channels API gives us that a channel is over.
+        Without this the mailbox, and for a plain channel its subscription, would
+        live as long as the process: memory grows with the number of connections
+        the process has ever served, not with the ones it is serving.
+        """
+        state = self._state()
+        if state.mailboxes.get(channel) is not box:
+            return
+        del state.mailboxes[channel]
+        stale = [box.subscription] if box.subscription is not None else []
+        for group in [g for g, members in state.groups.items() if channel in members]:
+            members = state.groups[group]
+            members.discard(channel)
+            if not members:
+                del state.groups[group]
+                subscription = state.group_subscriptions.pop(group, None)
+                if subscription is not None:
+                    stale.append(subscription)
+        # The bookkeeping above is done before the first await, so a second
+        # cancellation cannot leave this half applied.
+        for subscription in stale:
+            try:
+                await subscription.unsubscribe()
+            except Exception as error:  # the connection may already be gone
+                log.debug("channels_nats: could not unsubscribe %s: %s", channel, error)
 
     async def new_channel(self, prefix: str = "specific") -> str:
         channel = f"{prefix}.{self.client_id}!{uuid.uuid4().hex}"
@@ -215,15 +312,9 @@ class NatsChannelLayer(BaseChannelLayer):
         state.groups.setdefault(group, set()).add(channel)
         if group not in state.group_subscriptions:
             client = await self._client()
-
-            async def deliver(msg: t.Any) -> None:
-                message = self.serializer.loads(msg.data)
-                for member in list(state.groups.get(group, ())):
-                    box = state.mailboxes.get(member)
-                    if box is not None:
-                        self._enqueue(box, member, message)
-
-            state.group_subscriptions[group] = await client.subscribe(self.group_subject(group), cb=deliver)
+            state.group_subscriptions[group] = await client.subscribe(
+                self.group_subject(group), cb=self._group_deliver(state, group)
+            )
             await client.flush()
 
     async def group_discard(self, group: str, channel: str) -> None:

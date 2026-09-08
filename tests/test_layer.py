@@ -95,6 +95,73 @@ async def test_flush_clears_local_state(layer):
     assert not state.mailboxes and not state.groups and not state.group_subscriptions
 
 
+async def test_a_cancelled_receiver_releases_its_mailbox(make_layer):
+    """A consumer that goes away leaves its receive() cancelled: our only cleanup signal."""
+    worker = make_layer()
+    state = worker._state()
+    for _ in range(5):  # five connect/disconnect cycles must not accumulate anything
+        channel = await worker.new_channel()
+        await worker.group_add("room", channel)
+        receiving = asyncio.create_task(worker.receive(channel))
+        await asyncio.sleep(0.05)
+        receiving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await receiving
+
+    assert state.mailboxes == {}
+    assert state.groups == {}
+    assert state.group_subscriptions == {}
+
+
+async def test_a_cancelled_receiver_drops_a_plain_channel_subscription(make_layer):
+    worker = make_layer()
+    receiving = asyncio.create_task(worker.receive("plain"))
+    await asyncio.sleep(0.1)
+    subscription = worker._state().mailboxes["plain"].subscription
+    assert subscription is not None
+
+    receiving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receiving
+
+    assert "plain" not in worker._state().mailboxes
+    assert subscription._closed
+
+
+async def test_a_second_receiver_keeps_the_mailbox_alive(make_layer):
+    worker = make_layer()
+    channel = await worker.new_channel()
+    first = asyncio.create_task(worker.receive(channel))
+    second = asyncio.create_task(worker.receive(channel))
+    await asyncio.sleep(0.05)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    await worker.send(channel, {"type": "still here"})
+    assert await asyncio.wait_for(second, 5) == {"type": "still here"}
+
+
+async def test_subscriptions_are_restored_after_the_client_is_closed(make_layer):
+    """nats-py closes the client once it has spent max_reconnect_attempts."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    await worker.group_add("room", channel)
+    plain = asyncio.create_task(worker.receive("plain-channel"))
+    await asyncio.sleep(0.1)
+
+    await worker._state().client.close()
+    assert worker._state().client.is_closed
+
+    await worker.send(channel, {"type": "direct"})
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "direct"}
+    await worker.group_send("room", {"type": "group"})
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "group"}
+    await worker.send("plain-channel", {"type": "plain"})
+    assert await asyncio.wait_for(plain, 5) == {"type": "plain"}
+
+
 async def test_invalid_names_are_rejected(layer):
     with pytest.raises(TypeError):
         await layer.group_send("bad*name", {"type": "x"})
