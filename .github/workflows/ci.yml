@@ -38,4 +38,8 @@ jobs:
 
       - run: uv sync --all-extras
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # Type checking is platform-independent; one job is enough to catch a regression.
+      - if: runner.os == 'Linux' && matrix.python-version == '3.13'
+        run: uv run pyright
       - run: uv run pytest -v
