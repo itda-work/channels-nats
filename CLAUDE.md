@@ -19,6 +19,7 @@ channels_nats/
 └── serializers.py    json 기본, msgpack 선택
 tests/                nats-server 바이너리를 띄우는 통합 테스트 (NATS_SERVER, PATH, ~/go/bin 순서로 탐색)
 bench/fanout.py       group_send fan-out 지연·처리량. InMemory 레이어와 비교
+scripts/release_check.py  태그·CHANGELOG·분류자가 pyproject의 version과 맞는지
 ```
 
 ## 규약
@@ -27,7 +28,7 @@ bench/fanout.py       group_send fan-out 지연·처리량. InMemory 레이어�
 - subject 형식(`<prefix>.ch.<channel>`, `<prefix>.grp.<group>`)은 외부 계약이다. 바꾸면 README와 CHANGELOG에 남기고 메이저를 올린다.
 - Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. CI는 ubuntu와 windows 둘 다.
 - 커밋 메시지는 영어 Conventional Commits. 문서는 한국어.
-- 릴리스는 `pyproject.toml`의 version을 올리고 CHANGELOG에 절을 추가한 뒤 `v<version>` 태그를 푸시한다. `release.yml`이 빌드해 PyPI(trusted publishing, environment `pypi`)와 GitHub Release에 올린다. 토큰은 저장하지 않는다.
+- 릴리스는 `pyproject.toml`의 version을 올리고 CHANGELOG에 절을 추가한 뒤 `make release-check`로 확인하고 `v<version>` 태그를 푸시한다. 버전을 선언하는 곳은 `pyproject.toml` 하나다(`__version__`은 설치 메타데이터에서 읽는다). `release.yml`이 빌드해 PyPI(trusted publishing, environment `pypi`)와 GitHub Release에 올린다. 토큰은 저장하지 않는다.
 
 ## 함정
 

@@ -1,4 +1,4 @@
-.PHONY: install test lint format check bench nats
+.PHONY: install test lint format check bench nats release-check
 
 install:
 	uv sync --all-extras
@@ -16,6 +16,10 @@ format:
 
 check:
 	uv run pyright
+
+# Everything that must line up before a v<version> tag is pushed
+release-check:
+	python3 scripts/release_check.py
 
 # Fan-out benchmark (see bench/fanout.py). Override: make bench ARGS="--members 5000 --processes 8"
 bench:
