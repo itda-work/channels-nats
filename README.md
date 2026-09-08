@@ -119,6 +119,10 @@ macOS와 Linux에서는 `brew services start nats-server` 또는 systemd 유닛�
 make bench ARGS="--members 5000 --processes 8 --messages 50"
 ```
 
+## 실전 확인
+
+django-wireview의 테스트 프로젝트와 브라우저 E2E가 이 레이어 위에서 통과하며, daphne 4개를 NATS로 묶었을 때 2,000 연결 브로드캐스트가 862 ms에서 221 ms로, 이벤트 처리량이 3,013/s에서 10,485/s로 늘었다. 수치와 재현 명령은 [django-wireview의 설계 문서](https://github.com/itda-work/django-wireview/blob/main/docs/design/transport-abstraction.md)에 있다.
+
 ## 개발
 
 ```bash
