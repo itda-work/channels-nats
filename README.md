@@ -121,6 +121,83 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 
 macOS와 Linux에서는 `brew services start nats-server` 또는 systemd 유닛에 같은 설정 파일을 쓴다.
 
+## 클러스터로 확장
+
+한 대로 부족해지면 NATS 서버를 늘린다. 이 레이어 쪽 코드는 바뀌지 않고, `servers`에 주소를 더 적는 것이 전부다.
+
+```python
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_nats.NatsChannelLayer",
+        "CONFIG": {
+            "servers": ["nats://n1:4222", "nats://n2:4222", "nats://n3:4222"],
+        },
+    }
+}
+```
+
+**Core NATS 클러스터는 무공유다.** 서버끼리 주고받는 것은 "어느 노드에 어떤 subject의 구독자가 있는가"뿐이고, 저장도 합의(Raft)도 없다. 그래서 노드를 넣고 빼는 데 리밸런싱이 없다. 앱 프로세스는 아무 노드에나 붙으면 되고, `<prefix>.grp.<group>`에 발행한 메시지는 그 그룹의 구독자가 있는 노드로만 서버가 전달한다. Redis Cluster처럼 슬롯을 나누거나 마스터·레플리카를 관리할 것이 없다.
+
+**페일오버는 클라이언트가 한다.** 접속하면 서버가 클러스터의 다른 노드 주소를 알려주고(gossip), `nats-py`가 그 목록으로 재접속한다. 그래서 `servers`에는 노드 전부를 적지 않아도 되지만, 첫 접속이 실패하지 않도록 두세 개는 적어 두는 편이 낫다. 재시도 간격 같은 것은 `connect_options`로 `nats.connect()`에 그대로 넘긴다.
+
+```python
+"CONFIG": {
+    "servers": ["nats://n1:4222", "nats://n2:4222", "nats://n3:4222"],
+    "connect_options": {"max_reconnect_attempts": -1, "reconnect_time_wait": 0.5},
+}
+```
+
+**클러스터를 붙여도 저장이 생기지는 않는다.** 위 "Channels 규약과 다른 점"은 그대로다. 재접속이 끝나기 전에 발행된 메시지는 그 프로세스에 도착하지 않고, 노드가 죽으면 그 노드에 붙어 있던 프로세스의 구독은 재접속 후에 다시 만들어진다. 그 사이의 메시지는 사라진다. 노드를 늘려서 얻는 것은 처리량과 가용성이지 전달 보장이 아니다.
+
+리전이 여러 개면 클러스터끼리 gateway로 묶고(supercluster), 사설망·엣지 프로세스는 leaf node로 상위 클러스터에 붙인다. 둘 다 subject 규약과 무관하므로 레이어 설정은 역시 `servers`뿐이다.
+
+### 3노드 예시
+
+서버 쪽 설정만 보면 이렇다. `cluster.routes`로 서로를 가리키고, 클라이언트 포트(4222)와 클러스터 포트(6222)를 나눈다.
+
+```
+# n1.conf — n2, n3는 server_name만 바꾼다
+server_name: n1
+listen: 0.0.0.0:4222
+cluster {
+  name: channels
+  listen: 0.0.0.0:6222
+  routes: ["nats://n1:6222", "nats://n2:6222", "nats://n3:6222"]
+}
+```
+
+docker compose로 띄운다면:
+
+```yaml
+services:
+  n1: &node
+    image: nats:2.14-alpine
+    command: >
+      --name n1 --cluster_name channels
+      --cluster nats://0.0.0.0:6222
+      --routes nats://n1:6222,nats://n2:6222,nats://n3:6222
+      --http_port 8222
+    ports: ["4222:4222", "8222:8222"]
+  n2:
+    <<: *node
+    command: >
+      --name n2 --cluster_name channels
+      --cluster nats://0.0.0.0:6222
+      --routes nats://n1:6222,nats://n2:6222,nats://n3:6222
+    ports: ["4223:4222"]
+  n3:
+    <<: *node
+    command: >
+      --name n3 --cluster_name channels
+      --cluster nats://0.0.0.0:6222
+      --routes nats://n1:6222,nats://n2:6222,nats://n3:6222
+    ports: ["4224:4222"]
+```
+
+`curl localhost:8222/routez`로 라우트가 맺혔는지 확인한다. Windows에서 도커 없이 확인하려면 같은 머신에 포트만 달리해 `nats-server.exe -c n1.conf` 셋을 띄우면 된다.
+
+인증을 쓰는 클러스터라면 클라이언트 토큰과 별개로 라우트에도 자격이 필요하다. `cluster { authorization { user: route, password: ... } }`를 세 노드에 같이 넣고 `routes`를 `nats://route:...@n1:6222` 형태로 적는다.
+
 ## 벤치마크
 
 `make bench`가 프로세스 P개에 멤버 채널 N개를 나눠 구독시키고 `group_send`를 M회 발행해, 발행에서 각 멤버의 `receive`까지의 지연과 처리량을 잰다. 결과는 `bench/results/`에 남는다. 아래는 macOS arm64, Python 3.12, nats-server 2.14.6에서 잰 값이다 (2026-09-08).
