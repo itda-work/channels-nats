@@ -4,13 +4,13 @@ version = "0.2.0"
 description = "NATS-backed channel layer for Django Channels: one Go binary instead of Redis, Windows-friendly"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "itda-work" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: Django",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "channels>=4,<5",
+    "channels>=4.2.1,<5",
     "nats-py>=2.6,<3",
 ]
 

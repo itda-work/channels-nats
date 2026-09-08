@@ -24,6 +24,14 @@ jobs:
             exit 1
           fi
 
+      - name: Check that no license classifier accompanies License-Expression
+        # PEP 639: PyPI rejects an upload carrying both. `twine check` does not catch it.
+        run: |
+          if grep -q '^ *"License :: ' pyproject.toml; then
+            echo "drop the 'License :: ...' classifiers; PyPI rejects them alongside License-Expression"
+            exit 1
+          fi
+
       - run: uv build
       - run: uvx twine check dist/*
 
