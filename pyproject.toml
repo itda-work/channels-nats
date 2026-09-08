@@ -52,6 +52,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["channels_nats"]
+
 [tool.ruff.format]
 quote-style = "double"
 
