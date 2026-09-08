@@ -58,6 +58,8 @@ class _Mailbox:
     queue: asyncio.Queue[tuple[float, Message]]
     subscription: Subscription | None = None
     receivers: int = 0
+    dropped: int = 0
+    warned_at: float | None = None
 
 
 @dataclass
@@ -86,6 +88,10 @@ class NatsChannelLayer(BaseChannelLayer):
     """
 
     extensions = ["groups", "flush"]
+
+    #: A full mailbox stays full, so warn about the first drop and then at most
+    #: this often, rather than once per message.
+    drop_log_interval = 60.0
 
     def __init__(
         self,
@@ -201,10 +207,27 @@ class NatsChannelLayer(BaseChannelLayer):
         return deliver
 
     def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
+        now = time.monotonic()
         if box.queue.qsize() >= self.get_capacity(channel):
-            log.warning("channels_nats: mailbox for %s is full, dropping a message", channel)
+            box.dropped += 1
+            if box.warned_at is None or now - box.warned_at >= self.drop_log_interval:
+                log.warning(
+                    "channels_nats: mailbox for %s is full (capacity %d); %d message(s) dropped so far",
+                    channel,
+                    self.get_capacity(channel),
+                    box.dropped,
+                )
+                box.warned_at = now
             return
-        box.queue.put_nowait((time.monotonic(), message))
+        if box.dropped:
+            log.warning(
+                "channels_nats: mailbox for %s has room again after dropping %d message(s)",
+                channel,
+                box.dropped,
+            )
+            box.dropped = 0
+            box.warned_at = None
+        box.queue.put_nowait((now, message))
 
     async def _mailbox(self, channel: str) -> _Mailbox:
         """Local queue for ``channel``.

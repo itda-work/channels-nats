@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 from asgiref.sync import async_to_sync
@@ -83,6 +84,26 @@ async def test_full_mailbox_drops_new_messages(make_layer):
     assert (await small.receive(channel))["i"] == 1
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(small.receive(channel), 0.3)
+
+
+async def test_a_full_mailbox_warns_once_not_per_dropped_message(make_layer, caplog):
+    """A full mailbox stays full; one line per drop would bury the logs under load."""
+    small = make_layer(capacity=2)
+    channel = await small.new_channel()
+
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        for i in range(20):  # 2 fit, 18 are dropped
+            await small.send(channel, {"type": "n", "i": i})
+        await asyncio.sleep(0.3)
+        assert len([r for r in caplog.records if "is full" in r.getMessage()]) == 1
+
+        assert (await small.receive(channel))["i"] == 0
+        await small.send(channel, {"type": "n", "i": 99})
+        await asyncio.sleep(0.2)
+
+    recovered = [r for r in caplog.records if "has room again" in r.getMessage()]
+    assert len(recovered) == 1
+    assert "18 message(s)" in recovered[0].getMessage()
 
 
 async def test_flush_clears_local_state(layer):

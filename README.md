@@ -46,7 +46,7 @@ pip install "channels-nats[msgpack]" # bytes를 실어 보내야 하면
 | `servers` | `"nats://127.0.0.1:4222"` | 문자열 또는 목록 |
 | `prefix` | `"channels"` | subject 접두어. 한 NATS를 여러 앱이 나눠 쓸 때 구분 |
 | `expiry` | `60` | 초. 이보다 오래 대기한 메시지는 `receive`가 버린다 |
-| `capacity` | `100` | 채널당 로컬 대기열 크기. 넘치면 새 메시지를 버리고 경고 로그 |
+| `capacity` | `100` | 채널당 로컬 대기열 크기. 넘치면 새 메시지를 버린다. 경고는 첫 드롭에 한 번, 이후 60초에 한 번, 대기열에 자리가 나면 누적 개수와 함께 한 번 |
 | `channel_capacity` | `None` | 채널 이름 패턴별 용량 (Channels 규약과 같음) |
 | `serializer` | `"json"` | `"json"` 또는 `"msgpack"` |
 | `connect_options` | `{}` | `nats.connect()`에 그대로 전달 (재접속, TLS 등) |
