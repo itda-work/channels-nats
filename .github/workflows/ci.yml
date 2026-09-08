@@ -24,16 +24,17 @@ jobs:
       - name: Install nats-server (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -sL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" | tar xz
-          echo "$PWD/nats-server-${NATS_VERSION}-linux-amd64" >> "$GITHUB_PATH"
+          curl -sL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/nats-server-${NATS_VERSION}-linux-amd64" >> "$GITHUB_PATH"
 
       - name: Install nats-server (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Invoke-WebRequest "https://github.com/nats-io/nats-server/releases/download/$env:NATS_VERSION/nats-server-$env:NATS_VERSION-windows-amd64.zip" -OutFile nats.zip
-          Expand-Archive nats.zip -DestinationPath nats
-          "$PWD\nats\nats-server-$env:NATS_VERSION-windows-amd64" | Out-File -FilePath $env:GITHUB_PATH -Append
+          # Extract outside the checkout: a ./nats directory would make ruff treat `nats` as first-party.
+          Invoke-WebRequest "https://github.com/nats-io/nats-server/releases/download/$env:NATS_VERSION/nats-server-$env:NATS_VERSION-windows-amd64.zip" -OutFile "$env:RUNNER_TEMP\nats.zip"
+          Expand-Archive "$env:RUNNER_TEMP\nats.zip" -DestinationPath "$env:RUNNER_TEMP\nats"
+          "$env:RUNNER_TEMP\nats\nats-server-$env:NATS_VERSION-windows-amd64" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - run: uv sync --all-extras
       - run: uv run ruff check .
