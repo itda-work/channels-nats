@@ -183,6 +183,23 @@ async def test_subscriptions_are_restored_after_the_client_is_closed(make_layer)
     assert await asyncio.wait_for(plain, 5) == {"type": "plain"}
 
 
+def test_state_of_a_closed_loop_is_forgotten():
+    """A layer used from short-lived loops must not accumulate one state each."""
+    layer = NatsChannelLayer()
+
+    async def touch() -> None:
+        layer._state()
+
+    for _ in range(4):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(touch())
+        finally:
+            loop.close()
+
+    assert len(layer._states) == 1  # only the newest; its own successor will sweep it
+
+
 async def test_invalid_names_are_rejected(layer):
     with pytest.raises(TypeError):
         await layer.group_send("bad*name", {"type": "x"})

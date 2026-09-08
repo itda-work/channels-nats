@@ -119,6 +119,12 @@ class NatsChannelLayer(BaseChannelLayer):
         loop = asyncio.get_running_loop()
         state = self._states.get(loop)
         if state is None:
+            # A new loop is rare, so this is the cheap moment to forget the loops
+            # that have since been closed -- their connections died with them, and
+            # a closed loop can still be referenced elsewhere, so waiting for the
+            # garbage collector would not do.
+            for closed in [old for old in self._states if old.is_closed()]:
+                del self._states[closed]
             state = self._states[loop] = _LoopState()
         return state
 
