@@ -6,7 +6,9 @@ a Go front, a CLI) can join the same layer by publishing to them:
 - ``<prefix>.pc.<process>``  one message for one process-specific channel
   (``send`` to ``specific.<process>!<id>``); the full channel name travels in
   the ``Channel`` header and the receiving process routes it locally
-- ``<prefix>.ch.<channel>``  one message for a plain (shared-name) channel
+- ``<prefix>.ch.<channel>``  one message for a plain (shared-name) channel,
+  read under a queue group of the same name so that one reader gets it rather
+  than every process holding that name
 - ``<prefix>.grp.<group>``   one message for every member of a group (``group_send``)
 
 Semantics follow the Channels layer spec on an at-most-once transport:
@@ -152,7 +154,9 @@ class NatsChannelLayer(BaseChannelLayer):
         for channel, box in state.mailboxes.items():
             if box.subscription is not None:
                 box.subscription = await client.subscribe(
-                    self.channel_subject(channel), cb=self._channel_deliver(box, channel)
+                    self.channel_subject(channel),
+                    queue=self.channel_queue_group(channel),
+                    cb=self._channel_deliver(box, channel),
                 )
         for group in list(state.group_subscriptions):
             state.group_subscriptions[group] = await client.subscribe(
@@ -181,6 +185,17 @@ class NatsChannelLayer(BaseChannelLayer):
     def owns_channel(self, channel: str) -> bool:
         """Whether a process-specific channel was created by this layer instance."""
         return channel[: channel.index("!")].rsplit(".", 1)[-1] == self.client_id
+
+    def channel_queue_group(self, channel: str) -> str:
+        """Queue group a plain channel is read under.
+
+        A channel is a queue: when several processes read the same name, one of
+        them gets each message, not all of them. Core NATS gives that with a
+        queue group; a plain subscription would fan out and every worker in a
+        pool would run every job. Anything else joining ``<prefix>.ch.<channel>``
+        has to use this same group or single delivery breaks again.
+        """
+        return self.channel_subject(channel)
 
     def group_subject(self, group: str) -> str:
         return f"{self.prefix}.grp.{group}"
@@ -271,7 +286,9 @@ class NatsChannelLayer(BaseChannelLayer):
                 else:
                     client = await self._client()
                     box.subscription = await client.subscribe(
-                        self.channel_subject(channel), cb=self._channel_deliver(box, channel)
+                        self.channel_subject(channel),
+                        queue=self.channel_queue_group(channel),
+                        cb=self._channel_deliver(box, channel),
                     )
                     await client.flush()  # the server knows about the subscription before we return
             except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds

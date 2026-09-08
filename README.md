@@ -82,8 +82,10 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 | subject | 의미 |
 |---------|------|
 | `<prefix>.pc.<process>` | 프로세스 전용 채널 `specific.<process>!<id>`로의 `send`. 전체 채널 이름은 NATS 헤더 `Channel`에 실리고, 받은 프로세스가 로컬에서 라우팅한다. 프로세스당 구독 하나 |
-| `<prefix>.ch.<channel>` | `!`가 없는 일반 채널로의 `send`. 채널당 구독 하나 |
+| `<prefix>.ch.<channel>` | `!`가 없는 일반 채널로의 `send`. 채널당 구독 하나이고, subject와 같은 이름의 **큐 그룹**으로 구독한다. 그래서 여러 프로세스가 같은 채널 이름을 읽어도 메시지는 그중 하나에만 간다 |
 | `<prefix>.grp.<group>` | `group_send(group, message)`. 그룹에 멤버가 있는 프로세스마다 구독 하나 |
+
+일반 채널의 큐 그룹도 계약의 일부다. `.ch.` subject에 합류하는 외부 워커가 큐 그룹 없이 그냥 구독하면 그 워커도 사본을 받아 단일 전달이 깨진다.
 
 본문은 serializer로 직렬화한 Channels 메시지 dict다. 컨슈머 연결 하나의 비용은 로컬 대기열 하나이고 NATS 구독이 아니다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
 

@@ -106,6 +106,36 @@ async def test_a_full_mailbox_warns_once_not_per_dropped_message(make_layer, cap
     assert "18 message(s)" in recovered[0].getMessage()
 
 
+async def test_a_plain_channel_reaches_one_reader_not_every_process(make_layer):
+    """A channel is a queue: a worker pool sharing a name must not run the job N times."""
+    workers = [make_layer() for _ in range(3)]
+    receiving = [asyncio.create_task(worker.receive("worker-queue")) for worker in workers]
+    await asyncio.sleep(0.3)
+
+    await make_layer().send("worker-queue", {"type": "job"})
+    await asyncio.sleep(0.4)
+
+    delivered = [task for task in receiving if task.done()]
+    assert len(delivered) == 1
+    assert delivered[0].result() == {"type": "job"}
+    for task in receiving:
+        task.cancel()
+
+
+async def test_two_readers_in_one_process_share_the_channel(make_layer):
+    worker = make_layer()
+    first = asyncio.create_task(worker.receive("shared"))
+    second = asyncio.create_task(worker.receive("shared"))
+    await asyncio.sleep(0.2)
+
+    await make_layer().send("shared", {"type": "job"})
+    await asyncio.sleep(0.3)
+
+    assert len([task for task in (first, second) if task.done()]) == 1
+    first.cancel()
+    second.cancel()
+
+
 async def test_flush_clears_local_state(layer):
     channel = await layer.new_channel()
     await layer.group_add("room", channel)
