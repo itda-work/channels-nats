@@ -3,14 +3,19 @@
 Subjects are the contract. Anything that speaks NATS (another Python worker,
 a Go front, a CLI) can join the same layer by publishing to them:
 
-- ``<prefix>.ch.<channel>``  one message for one channel (``send``)
+- ``<prefix>.pc.<process>``  one message for one process-specific channel
+  (``send`` to ``specific.<process>!<id>``); the full channel name travels in
+  the ``Channel`` header and the receiving process routes it locally
+- ``<prefix>.ch.<channel>``  one message for a plain (shared-name) channel
 - ``<prefix>.grp.<group>``   one message for every member of a group (``group_send``)
 
 Semantics follow the Channels layer spec on an at-most-once transport:
 
-- ``group_send`` is one NATS publish; the server fans out. Each process holds
-  one subscription per group it has members in and copies the message into
-  the local mailbox of every member channel.
+- A process holds **one** subscription for all its process-specific channels
+  (consumers), one per group it has members in, and one per plain channel it
+  receives on. Per-connection cost is a local queue, not a NATS subscription.
+- ``group_send`` is one NATS publish; the server fans out. The group
+  subscription copies the message into the local mailbox of every member.
 - Messages older than ``expiry`` seconds are dropped on ``receive``; a
   mailbox holding ``capacity`` messages drops new ones (Channels' ``ChannelFull``
   cannot be raised on the sender's side over pub/sub).
@@ -58,6 +63,7 @@ class _LoopState:
     mailboxes: dict[str, _Mailbox] = field(default_factory=dict)
     groups: dict[str, set[str]] = field(default_factory=dict)
     group_subscriptions: dict[str, Subscription] = field(default_factory=dict)
+    process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
 
 
 class NatsChannelLayer(BaseChannelLayer):
@@ -112,8 +118,17 @@ class NatsChannelLayer(BaseChannelLayer):
                     state.client = await nats.connect(servers=self.servers, **self.connect_options)
         return state.client
 
+    CHANNEL_HEADER = "Channel"
+
     def channel_subject(self, channel: str) -> str:
+        """Subject a message for ``channel`` is published to."""
+        if "!" in channel:
+            return self.process_subject(channel)
         return f"{self.prefix}.ch.{channel}"
+
+    def process_subject(self, channel: str) -> str:
+        """Subject shared by every process-specific channel of one process (``specific.<id>!...``)."""
+        return f"{self.prefix}.pc.{channel[: channel.index('!')]}"
 
     def group_subject(self, group: str) -> str:
         return f"{self.prefix}.grp.{group}"
@@ -125,20 +140,46 @@ class NatsChannelLayer(BaseChannelLayer):
         box.queue.put_nowait((time.monotonic(), message))
 
     async def _mailbox(self, channel: str) -> _Mailbox:
-        """Local queue for ``channel``, subscribed to its subject on first use."""
+        """Local queue for ``channel``.
+
+        Process-specific channels share the process subscription; a plain
+        channel gets a subscription of its own on first use.
+        """
         state = self._state()
         box = state.mailboxes.get(channel)
         if box is None:
             box = _Mailbox(queue=asyncio.Queue())
             state.mailboxes[channel] = box
-            client = await self._client()
+            if "!" in channel:
+                await self._process_subscription(channel)
+            else:
+                client = await self._client()
 
-            async def deliver(msg: t.Any) -> None:
-                self._enqueue(box, channel, self.serializer.loads(msg.data))
+                async def deliver(msg: t.Any) -> None:
+                    self._enqueue(box, channel, self.serializer.loads(msg.data))
 
-            box.subscription = await client.subscribe(self.channel_subject(channel), cb=deliver)
-            await client.flush()  # the server knows about the subscription before we return
+                box.subscription = await client.subscribe(self.channel_subject(channel), cb=deliver)
+                await client.flush()  # the server knows about the subscription before we return
         return box
+
+    async def _process_subscription(self, channel: str) -> None:
+        """One subscription per process prefix, routing by the ``Channel`` header."""
+        state = self._state()
+        subject = self.process_subject(channel)
+        if subject in state.process_subscriptions:
+            return
+        client = await self._client()
+
+        async def deliver(msg: t.Any) -> None:
+            target = (msg.headers or {}).get(self.CHANNEL_HEADER)
+            if not isinstance(target, str):
+                return
+            box = state.mailboxes.get(target)
+            if box is not None:
+                self._enqueue(box, target, self.serializer.loads(msg.data))
+
+        state.process_subscriptions[subject] = await client.subscribe(subject, cb=deliver)
+        await client.flush()
 
     # ------------------------------------------------------------------ channels
 
@@ -147,7 +188,8 @@ class NatsChannelLayer(BaseChannelLayer):
         self.require_valid_channel_name(channel)
         assert "__asgi_channel__" not in message, "Reserved key '__asgi_channel__' in message"
         client = await self._client()
-        await client.publish(self.channel_subject(channel), self.serializer.dumps(message))
+        headers = {self.CHANNEL_HEADER: channel} if "!" in channel else None
+        await client.publish(self.channel_subject(channel), self.serializer.dumps(message), headers=headers)
 
     async def receive(self, channel: str) -> Message:
         self.require_valid_channel_name(channel)
@@ -214,7 +256,10 @@ class NatsChannelLayer(BaseChannelLayer):
         for box in list(state.mailboxes.values()):
             if box.subscription is not None:
                 await box.subscription.unsubscribe()
+        for subscription in list(state.process_subscriptions.values()):
+            await subscription.unsubscribe()
         state.group_subscriptions.clear()
+        state.process_subscriptions.clear()
         state.mailboxes.clear()
         state.groups.clear()
 

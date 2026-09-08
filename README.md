@@ -64,10 +64,11 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 
 | subject | 의미 |
 |---------|------|
-| `<prefix>.ch.<channel>` | `send(channel, message)` |
+| `<prefix>.pc.<process>` | 프로세스 전용 채널 `specific.<process>!<id>`로의 `send`. 전체 채널 이름은 NATS 헤더 `Channel`에 실리고, 받은 프로세스가 로컬에서 라우팅한다. 프로세스당 구독 하나 |
+| `<prefix>.ch.<channel>` | `!`가 없는 일반 채널로의 `send`. 채널당 구독 하나 |
 | `<prefix>.grp.<group>` | `group_send(group, message)`. 그룹에 멤버가 있는 프로세스마다 구독 하나 |
 
-본문은 serializer로 직렬화한 Channels 메시지 dict다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
+본문은 serializer로 직렬화한 Channels 메시지 dict다. 컨슈머 연결 하나의 비용은 로컬 대기열 하나이고 NATS 구독이 아니다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
 
 ## Windows 운영
 
@@ -121,7 +122,14 @@ make bench ARGS="--members 5000 --processes 8 --messages 50"
 
 ## 실전 확인
 
-django-wireview의 테스트 프로젝트와 브라우저 E2E가 이 레이어 위에서 통과하며, daphne 4개를 NATS로 묶었을 때 2,000 연결 브로드캐스트가 862 ms에서 221 ms로, 이벤트 처리량이 3,013/s에서 10,485/s로 늘었다. 수치와 재현 명령은 [django-wireview의 설계 문서](https://github.com/itda-work/django-wireview/blob/main/docs/design/transport-abstraction.md)에 있다.
+django-wireview의 테스트 프로젝트와 브라우저 E2E가 이 레이어 위에서 통과한다. daphne 4개를 NATS로 묶은 2,000 연결 실측(항목 5개 컴포넌트)은 다음과 같고, InMemory 레이어의 daphne 1개는 브로드캐스트 862 ms, 이벤트 3,013/s, 연결당 46 KB였다.
+
+| channels-nats | 연결당 RSS | join/s | 이벤트/s | 브로드캐스트 |
+|---|---:|---:|---:|---:|
+| 0.1.0 채널당 구독 | 61.3 KB | 1,861 | 11,621 | 202 ms |
+| 0.2.0 프로세스당 구독 | 55.3 KB | 2,167 | 11,758 | 143 ms |
+
+결과 JSON은 `bench/results/wireview-nats-4proc-0.2.0.json`이다. 수치와 재현 명령은 [django-wireview의 설계 문서](https://github.com/itda-work/django-wireview/blob/main/docs/design/transport-abstraction.md)에 있다.
 
 ## 개발
 

@@ -113,5 +113,34 @@ async def test_msgpack_serializer_keeps_bytes(make_layer):
 
 def test_subjects_are_the_contract():
     layer = NatsChannelLayer(prefix="app")
-    assert layer.channel_subject("specific.ab!cd") == "app.ch.specific.ab!cd"
+    assert layer.channel_subject("test-channel") == "app.ch.test-channel"
+    assert layer.channel_subject("specific.ab!cd") == "app.pc.specific.ab"
     assert layer.group_subject("room-1") == "app.grp.room-1"
+
+
+async def test_process_channels_share_one_subscription(layer):
+    channels = [await layer.new_channel() for _ in range(20)]
+
+    state = layer._state()
+    assert len(state.process_subscriptions) == 1
+    assert all(state.mailboxes[c].subscription is None for c in channels)
+    for channel in channels:
+        await layer.send(channel, {"type": "n", "to": channel})
+    for channel in channels:
+        assert (await asyncio.wait_for(layer.receive(channel), 5))["to"] == channel
+
+
+async def test_send_to_another_process_channel(make_layer):
+    """A message for ``specific.<other>!<id>`` is routed to the owning process by the Channel header."""
+    owner, sender = make_layer(), make_layer()
+    channel = await owner.new_channel()
+
+    await sender.send(channel, {"type": "direct", "n": 3})
+
+    assert await asyncio.wait_for(owner.receive(channel), 5) == {"type": "direct", "n": 3}
+
+
+def test_process_subject_is_derived_from_the_channel_prefix():
+    layer = NatsChannelLayer(prefix="app")
+    assert layer.channel_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
+    assert layer.process_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
