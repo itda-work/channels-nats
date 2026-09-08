@@ -7,7 +7,7 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 ### Added
 
 - `scripts/release_check.py`와 `make release-check`. 태그·CHANGELOG 절·License 분류자가 `pyproject.toml`의 version과 맞는지 본다. release.yml이 태그를 받아 같은 스크립트를 돌리므로 로컬과 CI가 같은 검사를 쓴다
-- 3노드 클러스터를 띄우는 `nats_cluster` fixture와 `tests/test_cluster.py`. 노드 간 group/채널 라우팅과, 워커가 붙어 있던 노드를 죽였을 때의 페일오버를 검증한다
+- 3노드 클러스터를 띄우는 `nats_cluster` fixture와 `tests/test_cluster.py`. 노드 간 group/채널 라우팅과, 워커가 붙어 있던 노드를 죽였을 때의 페일오버를 검증한다. 구독 관심사가 route를 타고 다른 노드까지 가는 데 걸리는 시간은 README 클러스터 절에 적었다
 - 벤치 결과 JSON과 출력에 무엇을 쟀는지 남긴다(`measured`: 레이어 버전, `git describe --dirty`, Python, nats-server). 파일만 보고 어느 버전의 수치인지 알 수 있고, 파일을 바꿔치기한 A/B는 `-dirty`로 드러난다
 
 ### Changed

@@ -33,5 +33,5 @@ scripts/release_check.py  태그·CHANGELOG·분류자가 pyproject의 version�
 ## 함정
 
 - NATS는 저장이 없다. 구독 전 발행은 사라진다. 테스트는 항상 수신자를 먼저 만든다.
-- `subscribe` 뒤 `flush()`를 기다려야 서버가 구독을 알고 있다. 이를 빼면 다른 프로세스의 직후 발행을 놓친다.
+- `subscribe` 뒤 `flush()`를 기다려야 서버가 구독을 알고 있다. 이를 빼면 다른 프로세스의 직후 발행을 놓친다. 클러스터에서는 `flush()`도 자기 노드까지만 보장하고 다른 노드로의 전파는 비동기다. 노드를 넘는 테스트는 도착할 때까지 발행을 반복한다(`tests/test_cluster.py`).
 - 이벤트 루프가 다르면 연결도 다르다. `async_to_sync`가 만든 루프는 별도 연결을 갖는다.
