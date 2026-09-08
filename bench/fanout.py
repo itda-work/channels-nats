@@ -34,6 +34,23 @@ def find_nats_server() -> str | None:
     return None
 
 
+def describe_revision() -> str | None:
+    """What tree this ran from. `-dirty` is the tell that a file was swapped in."""
+    return _run(["git", "describe", "--tags", "--always", "--dirty"], cwd=ROOT)
+
+
+def server_version(binary: str) -> str | None:
+    return _run([binary, "--version"])
+
+
+def _run(command: list[str], cwd: Path | None = None) -> str | None:
+    try:
+        finished = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return finished.stdout.strip() or None if finished.returncode == 0 else None
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -121,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     server = None
+    server_release = None
     url = args.url
     if url is None:
         binary = find_nats_server()
@@ -132,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             [binary, "-a", "127.0.0.1", "-p", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         wait_for_port(port)
+        server_release = server_version(binary)
         url = f"nats://127.0.0.1:{port}"
 
     tmp = Path(tempfile.mkdtemp(prefix="channels-nats-bench-"))
@@ -195,8 +214,21 @@ def main(argv: list[str] | None = None) -> int:
 
     memory_result = asyncio.run(in_memory(nats_result["members"], args.messages))
 
+    import channels_nats
+
+    measured = {
+        "channels_nats": channels_nats.__version__,
+        "revision": describe_revision() or "no git",
+        "python": sys.version.split()[0],
+        "nats_server": server_release,
+    }
+
     n = nats_result
     print(f"NATS fan-out: {n['members']} members over {args.processes} processes, {args.messages} group_send")
+    print(
+        f"  channels-nats {measured['channels_nats']} ({measured['revision']}), "
+        f"Python {measured['python']}, {measured['nats_server'] or 'server not started here'}"
+    )
     print(
         f"  delivered {n['delivered']}/{n['deliveries']}  p50 {n['p50_ms']:.2f} ms  "
         f"p95 {n['p95_ms']:.2f} ms  p99 {n['p99_ms']:.2f} ms  max {n['max_ms']:.1f} ms"
@@ -211,7 +243,14 @@ def main(argv: list[str] | None = None) -> int:
     results_dir.mkdir(exist_ok=True)
     path = results_dir / f"fanout-{time.strftime('%Y%m%d-%H%M%S')}.json"
     path.write_text(
-        json.dumps({"nats": nats_result, "in_memory": memory_result, "python": sys.version.split()[0]}, indent=1)
+        json.dumps(
+            {
+                "nats": nats_result,
+                "in_memory": memory_result,
+                "measured": measured,
+            },
+            indent=1,
+        )
     )
     print(f"written: {path}")
     return 0

@@ -6,10 +6,12 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Added
 
+- 벤치 결과 JSON과 출력에 무엇을 쟀는지 남긴다(`measured`: 레이어 버전, `git describe --dirty`, Python, nats-server). 파일만 보고 어느 버전의 수치인지 알 수 있고, 파일을 바꿔치기한 A/B는 `-dirty`로 드러난다
 - 3노드 클러스터를 띄우는 `nats_cluster` fixture와 `tests/test_cluster.py`. 노드 간 group/채널 라우팅과, 워커가 붙어 있던 노드를 죽였을 때의 페일오버를 검증한다
 
 ### Changed
 
+- `channels_nats.__version__`이 `"0.2.0"`에 멈춰 있었다. 0.2.1 릴리스가 `pyproject.toml`만 올렸기 때문이다. 이제 설치 메타데이터에서 읽어 두 곳이 어긋날 수 없다
 - `flush()`가 이미 끊긴 연결에서 `ConnectionClosedError`로 터졌다. 구독 해제 실패를 `_discard_mailbox`와 같은 방식으로 흘려보내고, 상태는 첫 await 전에 비운다. NATS가 죽은 상태의 종료가 에러가 되지 않는다
 - 이벤트 루프별 상태(`_states`)가 루프가 닫힌 뒤에도 남아 있었다. 새 루프가 등록될 때 닫힌 루프의 상태를 쓸어낸다. 루프를 만들고 버리는 코드에서 죽은 루프와 연결이 쌓이지 않는다
 - mailbox가 가득 차 메시지를 버릴 때 메시지마다 찍던 경고를, 첫 드롭 한 번과 이후 60초당 한 번(`drop_log_interval`)으로 줄인다. 자리가 나면 그동안 버린 개수를 한 줄로 남긴다. 가득 찬 상태는 보통 지속되므로 이전에는 과부하 시 로그가 폭주했다
