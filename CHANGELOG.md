@@ -2,14 +2,13 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
-## [Unreleased]
+## [0.2.1] - 2026-09-09
 
 ### Fixed
 
 - nats-py가 재접속을 포기하고 클라이언트를 닫으면(기본 `max_reconnect_attempts=60` 소진) 그 뒤 새로 연 연결에 구독이 하나도 없어서, 프로세스가 발행은 계속하고 수신은 영원히 못 하는 무음 상태가 됐다. 이제 재접속할 때 해당 루프의 프로세스·채널·그룹 구독을 모두 복구한다
 - 다른 프로세스가 만든 프로세스 전용 채널로 `receive`/`group_add`를 부르면 그 프로세스의 `pc` subject를 구독해 버려서, 해당 채널 메시지가 양쪽에 중복 전달됐다. 이제 `ValueError`로 막는다. 그 채널로 `send`하는 것은 그대로 동작한다
 - 컨슈머가 끊긴 뒤에도 mailbox가 남아, 메모리가 동시 연결 수가 아니라 누적 연결 수에 비례해 자랐다. 마지막 `receive()`가 취소되면 mailbox와 일반 채널 구독, 남은 그룹 멤버십을 정리한다
-
 - `channels` 하한을 4.2.1로 올린다. 레이어가 쓰는 `require_valid_channel_name`/`require_valid_group_name`이 4.2.1부터 있어서, 4.0~4.2.0에서는 첫 `send()`가 AttributeError로 죽었다
 - MIT LICENSE 파일을 추가하고 `license-files`로 sdist·wheel에 싣는다. 0.2.0 배포물에는 라이선스 원문이 없었다
 - `License :: OSI Approved :: MIT License` 분류자를 뺀다. PEP 639에서 `License-Expression`과 함께 쓰는 것이 금지됐다. release.yml에 재발 방지 검사를 넣었다 (`twine check`는 잡지 못한다)
