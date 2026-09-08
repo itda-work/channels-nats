@@ -166,6 +166,10 @@ class NatsChannelLayer(BaseChannelLayer):
         """Subject shared by every process-specific channel of one process (``specific.<id>!...``)."""
         return f"{self.prefix}.pc.{channel[: channel.index('!')]}"
 
+    def owns_channel(self, channel: str) -> bool:
+        """Whether a process-specific channel was created by this layer instance."""
+        return channel[: channel.index("!")].rsplit(".", 1)[-1] == self.client_id
+
     def group_subject(self, group: str) -> str:
         return f"{self.prefix}.grp.{group}"
 
@@ -208,6 +212,13 @@ class NatsChannelLayer(BaseChannelLayer):
         Process-specific channels share the process subscription; a plain
         channel gets a subscription of its own on first use.
         """
+        if "!" in channel and not self.owns_channel(channel):
+            # Subscribing would put us on the owner's process subject, so every message
+            # for its channels would be delivered twice: once there and once here.
+            raise ValueError(
+                f"{channel} belongs to another process; a process can only receive on "
+                "the channels its own new_channel() handed out"
+            )
         state = self._state()
         box = state.mailboxes.get(channel)
         if box is None:

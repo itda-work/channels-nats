@@ -207,6 +207,21 @@ async def test_send_to_another_process_channel(make_layer):
     assert await asyncio.wait_for(owner.receive(channel), 5) == {"type": "direct", "n": 3}
 
 
+async def test_receiving_on_another_process_channel_is_refused(make_layer):
+    """Subscribing to a foreign process subject would deliver its whole traffic twice."""
+    owner, other = make_layer(), make_layer()
+    channel = await owner.new_channel()
+
+    with pytest.raises(ValueError):
+        await other.receive(channel)
+    with pytest.raises(ValueError):
+        await other.group_add("room", channel)
+
+    await other.send(channel, {"type": "direct"})
+    assert await asyncio.wait_for(owner.receive(channel), 5) == {"type": "direct"}
+    assert channel not in other._state().mailboxes
+
+
 def test_process_subject_is_derived_from_the_channel_prefix():
     layer = NatsChannelLayer(prefix="app")
     assert layer.channel_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
