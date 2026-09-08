@@ -4,6 +4,10 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ## [Unreleased]
 
+### Added
+
+- 3노드 클러스터를 띄우는 `nats_cluster` fixture와 `tests/test_cluster.py`. 노드 간 group/채널 라우팅과, 워커가 붙어 있던 노드를 죽였을 때의 페일오버를 검증한다
+
 ### Changed
 
 - 이벤트 루프별 상태(`_states`)가 루프가 닫힌 뒤에도 남아 있었다. 새 루프가 등록될 때 닫힌 루프의 상태를 쓸어낸다. 루프를 만들고 버리는 코드에서 죽은 루프와 연결이 쌓이지 않는다

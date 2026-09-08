@@ -197,7 +197,7 @@ services:
     ports: ["4224:4222"]
 ```
 
-`curl localhost:8222/routez`로 라우트가 맺혔는지 확인한다. Windows에서 도커 없이 확인하려면 같은 머신에 포트만 달리해 `nats-server.exe -c n1.conf` 셋을 띄우면 된다.
+`curl localhost:8222/routez`로 라우트가 맺혔는지 확인한다. `tests/test_cluster.py`가 이 구성을 실제로 띄워 노드 간 라우팅과 노드 하나를 죽였을 때의 페일오버를 검증한다. Windows에서 도커 없이 확인하려면 같은 머신에 포트만 달리해 `nats-server.exe -c n1.conf` 셋을 띄우면 된다.
 
 인증을 쓰는 클러스터라면 클라이언트 토큰과 별개로 라우트에도 자격이 필요하다. `cluster { authorization { user: route, password: ... } }`를 세 노드에 같이 넣고 `routes`를 `nats://route:...@n1:6222` 형태로 적는다.
 
