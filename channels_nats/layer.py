@@ -95,6 +95,11 @@ class NatsChannelLayer(BaseChannelLayer):
     #: this often, rather than once per message.
     drop_log_interval = 60.0
 
+    #: A process holds a handful of event loops, not dozens. More than this
+    #: usually means loops are being abandoned without ``close()``: nothing can
+    #: tell those apart from live ones, so their connections stay held.
+    loop_state_warn_at = 32
+
     def __init__(
         self,
         servers: str | t.Sequence[str] = "nats://127.0.0.1:4222",
@@ -114,6 +119,7 @@ class NatsChannelLayer(BaseChannelLayer):
         self.connect_options = dict(connect_options or {})
         self.client_id = uuid.uuid4().hex[:12]
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
+        self._warned_about_loops = False
 
     # ------------------------------------------------------------------ plumbing
 
@@ -125,10 +131,21 @@ class NatsChannelLayer(BaseChannelLayer):
             # that have since been closed -- their connections died with them, and
             # a closed loop can still be referenced elsewhere, so waiting for the
             # garbage collector would not do.
-            for closed in [old for old in self._states if old.is_closed()]:
-                del self._states[closed]
+            self._forget_closed_loops()
             state = self._states[loop] = _LoopState()
+            if len(self._states) > self.loop_state_warn_at and not self._warned_about_loops:
+                self._warned_about_loops = True
+                log.warning(
+                    "channels_nats: %d event loops have used this layer. A loop abandoned "
+                    "without close() cannot be told from a live one, so its connection is "
+                    "still held; close the loop, or the layer, when you are done with it.",
+                    len(self._states),
+                )
         return state
+
+    def _forget_closed_loops(self) -> None:
+        for closed in [loop for loop in self._states if loop.is_closed()]:
+            del self._states[closed]
 
     async def _client(self) -> Client:
         state = self._state()
@@ -421,5 +438,6 @@ class NatsChannelLayer(BaseChannelLayer):
     async def close(self) -> None:
         """Close the connection owned by the current event loop."""
         state = self._states.pop(asyncio.get_running_loop(), None)
+        self._forget_closed_loops()  # shutting one loop down is a fine time to drop the dead ones
         if state is not None and state.client is not None and not state.client.is_closed:
             await state.client.drain()

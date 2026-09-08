@@ -249,6 +249,46 @@ async def test_flush_survives_a_connection_that_is_already_gone(make_layer):
         await receiving
 
 
+def test_close_also_forgets_other_closed_loops():
+    layer = NatsChannelLayer()
+
+    async def touch() -> None:
+        layer._state()
+
+    for _ in range(3):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(touch())
+        finally:
+            loop.close()
+    assert len(layer._states) == 1  # the newest is still there, its loop now closed
+
+    asyncio.run(layer.close())
+
+    assert len(layer._states) == 0
+
+
+def test_loops_abandoned_without_close_are_reported_once(caplog):
+    """Nothing can tell an abandoned loop from a live one, so say so rather than grow quietly."""
+    layer = NatsChannelLayer()
+    layer.loop_state_warn_at = 3
+    loops = []
+
+    async def touch() -> None:
+        layer._state()
+
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        for _ in range(6):
+            loop = asyncio.new_event_loop()
+            loops.append(loop)  # kept alive and never closed, which is the whole point
+            loop.run_until_complete(touch())
+
+    assert len([r for r in caplog.records if "event loops have used this layer" in r.getMessage()]) == 1
+    assert len(layer._states) == 6
+    for loop in loops:
+        loop.close()
+
+
 async def test_invalid_names_are_rejected(layer):
     with pytest.raises(TypeError):
         await layer.group_send("bad*name", {"type": "x"})
