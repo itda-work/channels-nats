@@ -60,12 +60,12 @@ async def test_group_members_do_not_share_one_message_object(make_layer):
     assert two["items"] == [1]
 
 
-async def test_ordering_holds_along_each_path(make_layer):
-    """What the layer does guarantee: order within the direct path and within the group path.
+async def test_ordering_holds_within_one_subscription(make_layer):
+    """What the layer guarantees is order within a single subscription.
 
-    Order between the two is not preserved -- they are separate subjects with
-    separate dispatch, and merging them would mean expanding groups at the
-    publisher, which is the cost this layer exists to avoid. See the README.
+    Between subscriptions -- direct against group, or one group against another --
+    it does not hold: nats-py gives every subscription its own queue and task, so
+    one drains ahead of the next. See the README.
     """
     worker = make_layer()
 
@@ -219,8 +219,8 @@ async def test_flush_clears_local_state(layer):
     assert not state.mailboxes and not state.groups and not state.group_subscriptions
 
 
-async def test_a_cancelled_receiver_releases_its_mailbox(make_layer):
-    """A consumer that goes away leaves its receive() cancelled: our only cleanup signal."""
+async def test_a_disconnecting_consumer_releases_its_mailbox(make_layer):
+    """A consumer leaves its groups and then its pending receive() is cancelled."""
     worker = make_layer()
     state = worker._state()
     for _ in range(5):  # five connect/disconnect cycles must not accumulate anything
@@ -228,6 +228,7 @@ async def test_a_cancelled_receiver_releases_its_mailbox(make_layer):
         await worker.group_add("room", channel)
         receiving = asyncio.create_task(worker.receive(channel))
         await asyncio.sleep(0.05)
+        await worker.group_discard("room", channel)  # what websocket_disconnect does
         receiving.cancel()
         with pytest.raises(asyncio.CancelledError):
             await receiving
@@ -235,6 +236,36 @@ async def test_a_cancelled_receiver_releases_its_mailbox(make_layer):
     assert state.mailboxes == {}
     assert state.groups == {}
     assert state.group_subscriptions == {}
+
+
+async def test_a_timed_out_read_is_not_a_disconnect(make_layer):
+    """Polling with wait_for cancels a read every timeout; groups must survive it."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    await worker.group_add("room", channel)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(worker.receive(channel), 0.2)
+
+    await worker.group_send("room", {"type": "still a member"})
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "still a member"}
+
+
+async def test_a_failed_resubscribe_leaves_no_healthy_looking_client(make_layer):
+    """An open connection carrying none of our subscriptions would look fine and receive nothing."""
+    worker = make_layer()
+    await worker.new_channel()
+    state = worker._state()
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError("resubscribe failed")
+
+    worker._resubscribe = failing
+    await state.client.close()
+
+    with pytest.raises(RuntimeError):
+        await worker.send("plain", {"type": "x"})
+    assert state.client.is_closed  # so the next attempt reconnects instead of going quiet
 
 
 async def test_a_cancelled_receiver_drops_a_plain_channel_subscription(make_layer):

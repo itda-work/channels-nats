@@ -168,9 +168,16 @@ class NatsChannelLayer(BaseChannelLayer):
             async with state.lock:
                 if state.client is None or state.client.is_closed:
                     stale = state.client is not None
-                    state.client = await self._connect(state)
+                    client = await self._connect(state)
                     if stale:
-                        await self._resubscribe(state, state.client)
+                        try:
+                            await self._resubscribe(state, client)
+                        except BaseException:
+                            # Leaving an open but unsubscribed client behind would look
+                            # healthy to every later call, and nothing would receive again.
+                            await client.close()
+                            raise
+                    state.client = client
         return state.client
 
     async def _connect(self, state: _LoopState) -> Client:
@@ -491,22 +498,14 @@ class NatsChannelLayer(BaseChannelLayer):
         state = self._state()
         if state.mailboxes.get(channel) is not box:
             return
+        if any(channel in members for members in state.groups.values()):
+            # A cancelled read is not proof the consumer is gone: an application
+            # polling with wait_for cancels one every timeout. A channel still in a
+            # group is still in use, and only group_discard or flush takes it out.
+            return
         del state.mailboxes[channel]
-        stale = [box.subscription] if box.subscription is not None else []
-        for group in [g for g, members in state.groups.items() if channel in members]:
-            members = state.groups[group]
-            members.discard(channel)
-            gone = state.group_channel_subscriptions.pop((group, channel), None)
-            if gone is not None:
-                stale.append(gone)
-            if not members:
-                del state.groups[group]
-                subscription = state.group_subscriptions.pop(group, None)
-                if subscription is not None:
-                    stale.append(subscription)
-        # The bookkeeping above is done before the first await, so a second
-        # cancellation cannot leave this half applied.
-        await self._unsubscribe(stale)
+        # Done before the first await, so a second cancellation cannot half apply it.
+        await self._unsubscribe([box.subscription] if box.subscription is not None else [])
 
     async def new_channel(self, prefix: str = "specific") -> str:
         channel = f"{prefix}.{self.client_id}!{uuid.uuid4().hex}"
