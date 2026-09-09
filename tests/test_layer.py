@@ -1252,3 +1252,60 @@ async def test_connects_that_time_out_do_not_pile_up_sockets():
         server.close()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(server.wait_closed(), 5)
+
+
+async def test_a_plain_channel_in_a_group_survives_a_reconnect(make_layer, caplog):
+    """A shared channel name in a group takes each message once, not once per process.
+
+    ``group_add`` on a plain channel subscribes to the group's subject under the
+    channel's queue group, so the group message reaches that name once however many
+    processes read it. That is the fourth kind of subscription ``_resubscribe()``
+    rebuilds, and the only one no test covered -- also the one its "restored N"
+    count left out.
+    """
+    a, b, publisher = make_layer(), make_layer(), make_layer()
+    got_a: list = []
+    got_b: list = []
+
+    async def collect(worker, into):
+        while True:
+            into.append(await worker.receive("shared"))
+
+    readers = [asyncio.create_task(collect(a, got_a)), asyncio.create_task(collect(b, got_b))]
+    try:
+        await asyncio.sleep(0.2)  # let both subscribe before anything is published
+        await a.group_add("room", "shared")
+        await b.group_add("room", "shared")
+
+        async def fan_out(count=10):
+            got_a.clear()
+            got_b.clear()
+            for index in range(count):
+                await publisher.group_send("room", {"type": "test.message", "index": index})
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if len(got_a) + len(got_b) >= count:
+                    break
+            await asyncio.sleep(0.2)  # a duplicate would arrive by now
+            return len(got_a) + len(got_b)
+
+        assert await fan_out() == 10, "a group message reached the shared name more than once"
+
+        with caplog.at_level(logging.WARNING, logger="channels_nats"):
+            for worker in (a, b):
+                await worker._state().client.close()
+            for _ in range(80):
+                await asyncio.sleep(0.25)
+                if all(not worker._state().client.is_closed for worker in (a, b)):
+                    break
+            assert all(not worker._state().client.is_closed for worker in (a, b)), "no reconnect"
+
+        assert await fan_out() == 10, "the group's queue subscription did not come back"
+
+        restored = [record.message for record in caplog.records if "restored" in record.message]
+        assert restored, "the reconnect was not reported"
+        assert all("restored 2 subscriptions" in message for message in restored), restored
+    finally:
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)

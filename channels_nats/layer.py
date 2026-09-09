@@ -433,6 +433,7 @@ class NatsChannelLayer(BaseChannelLayer):
             "channels_nats: the NATS connection was closed; reconnected and restored %d subscriptions",
             len(state.process_subscriptions)
             + len(state.group_subscriptions)
+            + len(state.group_channel_subscriptions)  # a plain channel in a group: rebuilt, so counted
             + sum(1 for box in state.mailboxes.values() if box.subscription is not None),
         )
 
