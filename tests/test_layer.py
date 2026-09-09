@@ -925,3 +925,21 @@ async def test_a_frame_that_is_not_a_message_does_not_end_the_consumer(layer, ca
     warned = [r for r in caplog.records if "not a Channels message" in r.getMessage()]
     assert len(warned) == 1  # rate-limited like the other drops
     assert layer._state().bad_frames == 2
+
+
+async def test_expiry_counts_time_in_the_mailbox_not_the_age_of_the_message(make_layer):
+    """The clock starts when the callback files the message, so a message can be
+    older than ``expiry`` and still be handed over.
+
+    Publish time would mean trusting the publisher's clock: with processes on
+    different clocks the same message would expire at different times in each.
+    That trade is deliberate, and this pins which side of it the layer is on.
+    """
+    reader = make_layer(expiry=1)
+    channel = await reader.new_channel()
+    sender = make_layer()
+    await sender.send(channel, {"type": "old"})
+
+    time.sleep(1.5)  # blocks the loop: the callback cannot file it while we wait
+
+    assert await asyncio.wait_for(reader.receive(channel), 5) == {"type": "old"}

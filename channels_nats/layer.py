@@ -18,9 +18,14 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   receives on. Per-connection cost is a local queue, not a NATS subscription.
 - ``group_send`` is one NATS publish; the server fans out. The group
   subscription copies the message into the local mailbox of every member.
-- Messages older than ``expiry`` seconds are dropped on ``receive``; a
-  mailbox holding ``capacity`` messages drops new ones (Channels' ``ChannelFull``
-  cannot be raised on the sender's side over pub/sub).
+- A message that has waited ``expiry`` seconds **in its mailbox** is dropped on
+  ``receive``. The clock starts when the callback files it, so neither the network
+  nor nats-py's own pending queue counts towards it: publish time would mean
+  trusting the publisher's clock, and expiry would then differ per process.
+  A mailbox holding ``capacity`` messages drops new ones (Channels' ``ChannelFull``
+  cannot be raised on the sender's side over pub/sub). ``capacity`` is per full
+  channel name, not shared across one process prefix as the spec's MUST asks: a
+  server with many connections would otherwise have them push each other out.
 - Messages published before a channel's first ``receive()`` (or ``new_channel()``)
   are lost: there is no subscriber yet. Consumers always subscribe on connect,
   so this only matters for ad-hoc channel names.
