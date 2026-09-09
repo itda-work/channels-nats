@@ -2,7 +2,11 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
-## [Unreleased]
+## [0.6.1] - 2026-09-09
+
+### Changed
+
+- **CI가 Windows에서도 테스트를 돌린다** (`windows-latest`, Python 3.13). 지금까지 Windows 지원은 코드 원칙으로만 지켰고 실행된 적이 없었다. lint·타입 검사는 Linux에 남긴다 — 플랫폼과 무관하고, Windows 체크아웃은 CRLF라 포맷 검사가 헛돈다. 여전히 CI 밖인 것은 Windows에서의 3.10과 ARM Windows이며, 0.6.0을 ARM Win11에서 손으로 확인했다(3.13 arm64·x64, 63/63)
 
 ### Fixed
 
