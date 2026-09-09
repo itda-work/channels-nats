@@ -64,6 +64,11 @@ Message = dict[str, t.Any]
 @dataclass
 class _Mailbox:
     queue: asyncio.Queue[tuple[float, bytes]]
+    #: Set once the mailbox either has its subscription or has given up. A mailbox
+    #: goes into ``mailboxes`` before subscribing, so a caller that finds one there
+    #: has to wait: an unsubscribed mailbox looks ready and receives nothing.
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    subscribed: bool = False
     subscription: Subscription | None = None
     receivers: int = 0
     dropped: int = 0
@@ -422,16 +427,19 @@ class NatsChannelLayer(BaseChannelLayer):
                 "receive on the channels its own new_channel() handed out"
             )
         state = self._state()
-        box = state.mailboxes.get(channel)
-        if box is not None:
-            return box
+        while (box := state.mailboxes.get(channel)) is not None:
+            await box.ready.wait()
+            if box.subscribed:
+                return box
+            # Whoever created it failed to subscribe and took it out again; the error
+            # was theirs to raise, so try once more on our own behalf.
         # Subscribing takes a round trip, and connecting takes several. Without this
         # lock, consumers arriving together each get past the check above and each
         # subscribe, so one message arrives once per racing caller.
         async with state.subscribe_lock:
             box = state.mailboxes.get(channel)
             if box is not None:  # somebody won the race while we waited
-                return box
+                return box  # and finished under this lock, so it is subscribed
             box = _Mailbox(queue=asyncio.Queue())
             state.mailboxes[channel] = box
             try:
@@ -448,9 +456,12 @@ class NatsChannelLayer(BaseChannelLayer):
             except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
                 if state.mailboxes.get(channel) is box:
                     del state.mailboxes[channel]
+                box.ready.set()  # after the removal, so a waiter retrying cannot find it again
                 if box.subscription is not None:
                     await self._unsubscribe([box.subscription])
                 raise
+            box.subscribed = True
+            box.ready.set()
             return box
 
     async def _process_subscription(self, channel: str) -> None:

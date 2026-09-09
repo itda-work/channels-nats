@@ -484,6 +484,22 @@ def test_subjects_are_the_contract():
     assert layer.group_subject("room-1") == "app.grp.room-1"
 
 
+async def test_a_mailbox_is_not_handed_out_before_it_is_subscribed(make_layer):
+    """A caller that gets a mailbox has to be able to trust that it receives.
+
+    ``_mailbox`` registers the mailbox before it subscribes, so a caller arriving
+    in between used to get one that nothing feeds yet.
+    """
+    worker = make_layer()
+    first = asyncio.create_task(worker._mailbox("shared-channel"))
+    await asyncio.sleep(0)  # let it register the mailbox and start subscribing
+
+    second = await asyncio.wait_for(worker._mailbox("shared-channel"), 5)
+
+    assert second.subscription is not None
+    assert second is await first
+
+
 async def test_process_channels_share_one_subscription(layer):
     channels = [await layer.new_channel() for _ in range(20)]
 
