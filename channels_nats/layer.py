@@ -24,10 +24,13 @@ Semantics follow the Channels layer spec on an at-most-once transport:
 - Messages published before a channel's first ``receive()`` (or ``new_channel()``)
   are lost: there is no subscriber yet. Consumers always subscribe on connect,
   so this only matters for ad-hoc channel names.
-- A mailbox lives until its last ``receive()`` is cancelled, which is how a
-  consumer's disconnect reaches the layer; then the mailbox and, for a plain
-  channel, its subscription go away -- unless the channel is still in a group,
-  which means it is still in use and a cancelled read was only a cancelled read.
+- A process channel's mailbox lives until it has had no receiver, no traffic and
+  no group membership for ``mailbox_grace`` seconds. Cancellation cannot carry
+  this: an application polling with ``wait_for`` cancels a read every timeout and
+  is still there, and a consumer ending on a channel-layer message leaves no
+  pending read to cancel at all. A plain channel is different -- its subscription
+  is under the channel's queue group, so it is released on the cancelled read
+  rather than held, and polling one loses what arrives between two polls.
 - If nats-py gives up reconnecting and closes the client, the next call opens a
   new connection and restores this loop's subscriptions on it.
 
@@ -69,6 +72,9 @@ class _Mailbox:
     #: has to wait: an unsubscribed mailbox looks ready and receives nothing.
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     subscribed: bool = False
+    #: Last time a message arrived or a receiver left. What decides whether the
+    #: consumer behind a process channel is still there.
+    active_at: float = field(default_factory=time.monotonic)
     subscription: Subscription | None = None
     receivers: int = 0
     dropped: int = 0
@@ -96,6 +102,7 @@ class _LoopState:
     group_channel_subscriptions: dict[tuple[str, str], Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
+    swept_at: float = 0.0
 
 
 class NatsChannelLayer(BaseChannelLayer):
@@ -121,6 +128,13 @@ class NatsChannelLayer(BaseChannelLayer):
     #: A full mailbox stays full, so warn about the first drop and then at most
     #: this often, rather than once per message.
     drop_log_interval = 60.0
+
+    #: How long a process channel's mailbox is kept after its last receiver goes
+    #: away. It has to be longer than a consumer may spend handling one message:
+    #: no ``receive()`` is outstanding while its handler runs. Deliberately not
+    #: tied to ``expiry`` -- tightening how long a message may wait must not start
+    #: reclaiming mailboxes out from under a slow handler.
+    mailbox_grace = 60.0
 
     #: A process holds a handful of event loops, not dozens. More than this
     #: usually means loops are being abandoned without ``close()``: nothing can
@@ -436,6 +450,7 @@ class NatsChannelLayer(BaseChannelLayer):
             )
             box.dropped = 0
             box.warned_at = None
+        box.active_at = now
         box.queue.put_nowait((now, payload))
 
     async def _mailbox(self, channel: str) -> _Mailbox:
@@ -452,6 +467,7 @@ class NatsChannelLayer(BaseChannelLayer):
                 "receive on the channels its own new_channel() handed out"
             )
         state = self._state()
+        self._sweep_mailboxes(state)
         while (box := state.mailboxes.get(channel)) is not None:
             await box.ready.wait()
             if box.subscribed:
@@ -527,17 +543,54 @@ class NatsChannelLayer(BaseChannelLayer):
             raise
         finally:
             box.receivers -= 1
-            if cancelled and box.receivers == 0:
-                await self._discard_mailbox(channel, box)
+            if box.receivers == 0:
+                box.active_at = time.monotonic()  # the grace period starts here
+                if cancelled and "!" not in channel:
+                    await self._discard_mailbox(channel, box)
+
+    def _sweep_mailboxes(self, state: _LoopState) -> None:
+        """Forget the process channels whose consumers have gone.
+
+        Cancellation cannot carry this on its own. An application polling with
+        ``wait_for`` cancels a ``receive()`` every timeout and is still there, and
+        a consumer that ends on a channel-layer message (``StopConsumer``) leaves
+        no pending ``receive()`` to cancel at all -- Channels cancels the task it
+        holds, but that task has already completed. So a process channel's mailbox
+        goes when it has had no receiver and no traffic for ``mailbox_grace``.
+
+        Only process channels. A plain channel holds a queue-group subscription,
+        and keeping that while nobody drains the mailbox takes messages away from
+        the processes that would have read them; those go on being dropped on the
+        cancelled read (see ``_discard_mailbox``).
+
+        Called from ``_mailbox()``, so any process still receiving keeps sweeping,
+        and throttled because that is every ``receive()``.
+        """
+        now = time.monotonic()
+        if now - state.swept_at < self.mailbox_grace / 2:
+            return
+        state.swept_at = now
+        in_a_group = {member for members in state.groups.values() for member in members}
+        for channel, box in list(state.mailboxes.items()):
+            if "!" not in channel or box.subscription is not None:
+                continue  # a plain channel, whose subscription is not ours to drop here
+            if box.receivers or channel in in_a_group:
+                continue  # still read, or still a group member and so still in use
+            if now - box.active_at <= self.mailbox_grace:
+                continue
+            del state.mailboxes[channel]
 
     async def _discard_mailbox(self, channel: str, box: _Mailbox) -> None:
-        """Forget a channel whose last receiver was cancelled.
+        """Forget a plain channel whose last receiver was cancelled.
 
-        A consumer that goes away leaves its pending ``receive()`` cancelled, and
-        that is the only signal the Channels API gives us that a channel is over.
-        Without this the mailbox, and for a plain channel its subscription, would
-        live as long as the process: memory grows with the number of connections
-        the process has ever served, not with the ones it is serving.
+        Its subscription is under the channel's queue group, so the server hands
+        it a share of that channel's messages. Holding it while nobody reads takes
+        those messages away from the processes that would, which is why a plain
+        channel is released on the cancelled read rather than waiting out
+        ``mailbox_grace`` like a process channel does (see ``_sweep_mailboxes``).
+
+        The cost is the other half of the trade: an application polling a plain
+        channel with ``wait_for`` loses what arrives between two polls.
         """
         state = self._state()
         if state.mailboxes.get(channel) is not box:

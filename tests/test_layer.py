@@ -88,6 +88,7 @@ async def test_a_cancelled_group_add_leaves_no_membership_behind(make_layer):
     cancellation in between used to leave one that nothing feeds.
     """
     worker = make_layer()
+    worker.mailbox_grace = 0.1
     channel = await worker.new_channel()  # its mailbox exists, so group_add gets to the lock
     state = worker._state()
 
@@ -106,6 +107,8 @@ async def test_a_cancelled_group_add_leaves_no_membership_behind(make_layer):
     receiving.cancel()
     with pytest.raises(asyncio.CancelledError):
         await receiving
+    await asyncio.sleep(0.15)
+    await worker.new_channel()  # sweeps
     assert channel not in state.mailboxes  # a phantom membership would have held it
 
 
@@ -250,6 +253,7 @@ async def test_flush_clears_local_state(layer):
 async def test_a_disconnecting_consumer_releases_its_mailbox(make_layer):
     """A consumer leaves its groups and then its pending receive() is cancelled."""
     worker = make_layer()
+    worker.mailbox_grace = 0.1
     state = worker._state()
     for _ in range(5):  # five connect/disconnect cycles must not accumulate anything
         channel = await worker.new_channel()
@@ -261,9 +265,46 @@ async def test_a_disconnecting_consumer_releases_its_mailbox(make_layer):
         with pytest.raises(asyncio.CancelledError):
             await receiving
 
-    assert state.mailboxes == {}
     assert state.groups == {}
     assert state.group_subscriptions == {}
+    await asyncio.sleep(0.15)  # the mailboxes go once their grace period is out
+    fresh = await worker.new_channel()  # any mailbox lookup sweeps
+    assert list(state.mailboxes) == [fresh]
+
+
+async def test_polling_a_process_channel_keeps_what_arrives_between_polls(make_layer):
+    """A cancelled read is not a disconnect, and a channel in no group is no exception."""
+    worker, publisher = make_layer(), make_layer()
+    channel = await worker.new_channel()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(worker.receive(channel), 0.2)
+
+    await publisher.send(channel, {"type": "between polls"})
+    await asyncio.sleep(0.2)  # let it arrive while nothing is reading; a dropped mailbox loses it here
+
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "between polls"}
+
+
+async def test_a_consumer_that_ends_on_a_message_releases_its_mailbox(make_layer):
+    """Channels cancels the receive task it holds, but that task has already completed.
+
+    A consumer raising StopConsumer from a channel-layer message therefore sends no
+    cancellation the layer can see, and nothing here can wait for one.
+    """
+    worker = make_layer()
+    worker.mailbox_grace = 0.1
+    channel = await worker.new_channel()
+    state = worker._state()
+
+    await worker.send(channel, {"type": "the last one"})
+    receiving = asyncio.create_task(worker.receive(channel))
+    assert await asyncio.wait_for(receiving, 5) == {"type": "the last one"}
+    receiving.cancel()  # await_many_dispatch's finally, on a task that is already done
+    await asyncio.sleep(0.15)
+
+    await worker.new_channel()  # any mailbox lookup sweeps
+    assert channel not in state.mailboxes
 
 
 async def test_a_timed_out_read_is_not_a_disconnect(make_layer):
