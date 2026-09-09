@@ -32,7 +32,11 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   new connection and restores this loop's subscriptions on it.
 
 Connections are per event loop, so ``async_to_sync(layer.group_send)`` from
-Django signals or views works alongside the consumers' loop.
+Django signals or views works alongside the consumers' loop. A process-specific
+channel belongs to the loop whose ``new_channel()`` handed it out: mailboxes and
+subscriptions live in that loop, and receiving on it from another one would put a
+second subscription on the same process subject and deliver every message twice.
+
 """
 
 from __future__ import annotations
@@ -71,6 +75,10 @@ class _LoopState:
     """Everything bound to one asyncio event loop."""
 
     client: Client | None = None
+    #: Names the process channels this loop hands out. Per loop, not per instance:
+    #: each loop has its own connection, subscription and mailboxes, so two loops
+    #: sharing one id would subscribe to one subject and deliver each message twice.
+    client_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     #: Held while a subscription is being created, so that coroutines racing to
     #: reach the same subject end up sharing one. Never taken inside ``lock``.
@@ -133,7 +141,6 @@ class NatsChannelLayer(BaseChannelLayer):
         self.prefix = prefix
         self.group_expiry = group_expiry
         self.connect_options = dict(connect_options or {})
-        self.client_id = uuid.uuid4().hex[:12]
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
         self._warned_about_loops = False
 
@@ -264,8 +271,8 @@ class NatsChannelLayer(BaseChannelLayer):
         return f"{self.prefix}.pc.{channel[: channel.index('!')]}"
 
     def owns_channel(self, channel: str) -> bool:
-        """Whether a process-specific channel was created by this layer instance."""
-        return channel[: channel.index("!")].rsplit(".", 1)[-1] == self.client_id
+        """Whether ``new_channel()`` on the running loop handed this channel out."""
+        return channel[: channel.index("!")].rsplit(".", 1)[-1] == self._state().client_id
 
     def channel_queue_group(self, channel: str) -> str:
         """Queue group a plain channel is read under.
@@ -411,8 +418,8 @@ class NatsChannelLayer(BaseChannelLayer):
             # Subscribing would put us on the owner's process subject, so every message
             # for its channels would be delivered twice: once there and once here.
             raise ValueError(
-                f"{channel} belongs to another process; a process can only receive on "
-                "the channels its own new_channel() handed out"
+                f"{channel} belongs to another process or event loop; a loop can only "
+                "receive on the channels its own new_channel() handed out"
             )
         state = self._state()
         box = state.mailboxes.get(channel)
@@ -509,7 +516,7 @@ class NatsChannelLayer(BaseChannelLayer):
         await self._unsubscribe([box.subscription] if box.subscription is not None else [])
 
     async def new_channel(self, prefix: str = "specific") -> str:
-        channel = f"{prefix}.{self.client_id}!{uuid.uuid4().hex}"
+        channel = f"{prefix}.{self._state().client_id}!{uuid.uuid4().hex}"
         await self._mailbox(channel)  # subscribe now so nothing sent before the first receive() is lost
         return channel
 

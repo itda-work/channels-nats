@@ -2,6 +2,12 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
+## [Unreleased]
+
+### Fixed
+
+- 같은 레이어 인스턴스를 **두 이벤트 루프**에서 수신하면 프로세스 전용 채널이 중복 전달됐다. 채널 이름의 프로세스 id가 인스턴스당 하나여서 두 루프가 같은 `<prefix>.pc.<process>` subject에 각각 구독을 만들고, 각자 자기 mailbox에 넣었다 — `send()` 한 번이 두 번 도착한다(재현함). id를 이벤트 루프별로 두어 루프마다 subject가 갈리고, 다른 루프의 채널로 `receive`·`group_add`를 부르면 기존 "다른 프로세스의 채널" 경로와 같이 `ValueError`가 된다. subject 형식은 그대로다 (#3)
+
 ## [0.3.2] - 2026-09-09
 
 ### Changed

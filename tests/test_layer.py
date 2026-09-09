@@ -521,6 +521,30 @@ async def test_receiving_on_another_process_channel_is_refused(make_layer):
     assert channel not in other._state().mailboxes
 
 
+async def test_receiving_on_a_process_channel_of_another_loop_is_refused(make_layer):
+    """A channel belongs to the loop that made it: two loops holding one would each get a copy.
+
+    Both loops subscribe to the same process subject, and each delivers to its own
+    mailbox, so one send() arrives twice -- at-most-once broken.
+    """
+    worker = make_layer()
+    channel = await worker.new_channel()
+
+    def another_loop() -> None:
+        async def main() -> None:
+            with pytest.raises(ValueError):
+                await asyncio.wait_for(worker.receive(channel), 2)
+            with pytest.raises(ValueError):
+                await asyncio.wait_for(worker.group_add("room", channel), 2)
+
+        asyncio.run(main())
+
+    await asyncio.to_thread(another_loop)
+
+    await worker.send(channel, {"type": "once"})
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "once"}
+
+
 def test_process_subject_is_derived_from_the_channel_prefix():
     layer = NatsChannelLayer(prefix="app")
     assert layer.channel_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
