@@ -352,15 +352,33 @@ class NatsChannelLayer(BaseChannelLayer):
             )
         await client.publish(subject, payload, headers=headers)
 
+    def _drop_expired(self, box: _Mailbox, now: float) -> None:
+        """Reclaim the room taken by messages ``receive()`` would throw away anyway.
+
+        Synchronous, so the queue is never seen half drained.
+        """
+        kept = []
+        while not box.queue.empty():
+            entry = box.queue.get_nowait()
+            if now - entry[0] <= self.expiry:
+                kept.append(entry)
+        for entry in kept:
+            box.queue.put_nowait(entry)
+
     def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
         now = time.monotonic()
-        if box.queue.qsize() >= self.get_capacity(channel):
+        capacity = self.get_capacity(channel)
+        if box.queue.qsize() >= capacity:
+            # A stalled consumer leaves stale messages holding every slot, and then
+            # the live ones are dropped in favour of messages nobody will be given.
+            self._drop_expired(box, now)
+        if box.queue.qsize() >= capacity:
             box.dropped += 1
             if box.warned_at is None or now - box.warned_at >= self.drop_log_interval:
                 log.warning(
                     "channels_nats: mailbox for %s is full (capacity %d); %d message(s) dropped so far",
                     channel,
-                    self.get_capacity(channel),
+                    capacity,
                     box.dropped,
                 )
                 box.warned_at = now

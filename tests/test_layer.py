@@ -60,6 +60,27 @@ async def test_group_members_do_not_share_one_message_object(make_layer):
     assert two["items"] == [1]
 
 
+async def test_ordering_holds_along_each_path(make_layer):
+    """What the layer does guarantee: order within the direct path and within the group path.
+
+    Order between the two is not preserved -- they are separate subjects with
+    separate dispatch, and merging them would mean expanding groups at the
+    publisher, which is the cost this layer exists to avoid. See the README.
+    """
+    worker = make_layer()
+
+    direct = await worker.new_channel()
+    for i in range(20):
+        await worker.send(direct, {"n": i})
+    assert [(await asyncio.wait_for(worker.receive(direct), 5))["n"] for _ in range(20)] == list(range(20))
+
+    grouped = await worker.new_channel()
+    await worker.group_add("ordered", grouped)
+    for i in range(20):
+        await worker.group_send("ordered", {"n": i})
+    assert [(await asyncio.wait_for(worker.receive(grouped), 5))["n"] for _ in range(20)] == list(range(20))
+
+
 async def test_group_discard_stops_delivery(layer):
     channel = await layer.new_channel()
     await layer.group_add("room", channel)
@@ -174,6 +195,18 @@ def test_channel_capacity_patterns_are_compiled():
 
     assert layer.get_capacity("specific.abc!def") == 2
     assert layer.get_capacity("other-channel") == layer.capacity
+
+
+async def test_expired_messages_do_not_hold_the_capacity(make_layer):
+    """A stalled consumer must not end up with a queue full of messages nobody will get."""
+    small = make_layer(capacity=1, expiry=0.2)
+    channel = await small.new_channel()
+
+    await small.send(channel, {"n": "stale"})
+    await asyncio.sleep(0.5)  # the queued message is past its expiry now
+    await small.send(channel, {"n": "fresh"})
+
+    assert (await asyncio.wait_for(small.receive(channel), 5))["n"] == "fresh"
 
 
 async def test_flush_clears_local_state(layer):
