@@ -227,6 +227,18 @@ class NatsChannelLayer(BaseChannelLayer):
                 )
         return state
 
+    def _state_if_open(self) -> _LoopState | None:
+        """This loop's state, or None -- without making one.
+
+        ``_state()`` creates on demand, which is right for a caller that is about to
+        use the layer and wrong for one that is only tidying up after itself: a
+        cancelled read arriving after ``close()`` would bring the state of a loop the
+        caller has just closed back. The revived entry holds no connection and no
+        subscription, but it counts towards ``loop_state_warn_at``, whose warning is
+        about loops that still hold one.
+        """
+        return self._states.get(asyncio.get_running_loop())
+
     def _forget_closed_loops(self) -> None:
         for closed in [loop for loop in self._states if loop.is_closed()]:
             del self._states[closed]
@@ -788,7 +800,9 @@ class NatsChannelLayer(BaseChannelLayer):
         The cost is the other half of the trade: an application polling a plain
         channel with ``wait_for`` loses what arrives between two polls.
         """
-        state = self._state()
+        state = self._state_if_open()
+        if state is None:
+            return  # close() took the whole state; there is no bookkeeping to undo
         if state.mailboxes.get(channel) is not box:
             return
         if any(channel in members for members in state.groups.values()):

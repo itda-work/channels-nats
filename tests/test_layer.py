@@ -972,3 +972,24 @@ async def test_close_ends_every_reader_of_a_shared_channel(layer):
     for reader in readers:
         with pytest.raises(ChannelLayerClosed):
             await asyncio.wait_for(reader, 5)
+
+
+async def test_a_cancelled_read_does_not_revive_a_closed_loop(layer):
+    """``close()`` drops this loop's state; a cancelled read must not put it back.
+
+    ``receive()`` releases a plain channel's mailbox on a cancelled read, and that
+    used to ask for the loop's state -- which creates one when it is gone. The
+    revived entry holds no connection and no subscription, but it counts towards
+    ``loop_state_warn_at``, whose warning is about loops that still hold one.
+    """
+    waiting = asyncio.create_task(layer.receive("plain-name"))
+    await asyncio.sleep(0.1)  # let it subscribe and settle on the queue
+
+    closing = asyncio.create_task(layer.close())
+    await asyncio.sleep(0)  # close() has popped the state and woken the waiter
+    waiting.cancel()  # and the cancel arrives before the wake-up gets to run
+    await closing
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    assert layer._states == {}
