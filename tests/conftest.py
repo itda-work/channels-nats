@@ -86,16 +86,30 @@ def _wait_for_routes(monitor_port: int, expected: int, timeout: float = 20.0) ->
 @dataclass
 class _Cluster:
     urls: list[str]
-    processes: list[subprocess.Popen] = field(default_factory=list)
+    commands: list[list[str]] = field(default_factory=list)
+    client_ports: list[int] = field(default_factory=list)
+    monitor_ports: list[int] = field(default_factory=list)
+    processes: list[subprocess.Popen | None] = field(default_factory=list)
+
+    def start(self, index: int) -> None:
+        """Bring a node up on the ports it had; a restarted node rejoins by route."""
+        self.processes[index] = subprocess.Popen(
+            self.commands[index], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        _wait_for_port(self.client_ports[index])
+        _wait_for_routes(self.monitor_ports[index], expected=len(self.commands) - 1)
 
     def stop(self, index: int) -> None:
         """Take one node down, as a rolling restart or a crash would."""
         process = self.processes[index]
+        if process is None:
+            return
         process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+        self.processes[index] = None
 
 
 @pytest.fixture
@@ -113,32 +127,37 @@ def nats_cluster():
     monitor_ports = [_free_port() for _ in range(3)]
     routes = ",".join(f"nats://127.0.0.1:{port}" for port in route_ports)
 
-    cluster = _Cluster(urls=[f"nats://127.0.0.1:{port}" for port in client_ports])
-    for index in range(3):
-        cluster.processes.append(
-            subprocess.Popen(
-                [
-                    binary,
-                    "-a",
-                    "127.0.0.1",
-                    "-p",
-                    str(client_ports[index]),
-                    "-m",
-                    str(monitor_ports[index]),
-                    "--name",
-                    f"n{index}",
-                    "--cluster_name",
-                    "channels-nats-test",
-                    "--cluster",
-                    f"nats://127.0.0.1:{route_ports[index]}",
-                    "--routes",
-                    routes,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        )
+    cluster = _Cluster(
+        urls=[f"nats://127.0.0.1:{port}" for port in client_ports],
+        commands=[
+            [
+                binary,
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(client_ports[index]),
+                "-m",
+                str(monitor_ports[index]),
+                "--name",
+                f"n{index}",
+                "--cluster_name",
+                "channels-nats-test",
+                "--cluster",
+                f"nats://127.0.0.1:{route_ports[index]}",
+                "--routes",
+                routes,
+            ]
+            for index in range(3)
+        ],
+        client_ports=client_ports,
+        monitor_ports=monitor_ports,
+        processes=[None] * 3,
+    )
     try:
+        for index in range(3):
+            cluster.processes[index] = subprocess.Popen(
+                cluster.commands[index], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
         for port in client_ports:
             _wait_for_port(port)
         for port in monitor_ports:
