@@ -26,7 +26,8 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   so this only matters for ad-hoc channel names.
 - A mailbox lives until its last ``receive()`` is cancelled, which is how a
   consumer's disconnect reaches the layer; then the mailbox and, for a plain
-  channel, its subscription go away.
+  channel, its subscription go away -- unless the channel is still in a group,
+  which means it is still in use and a cancelled read was only a cancelled read.
 - If nats-py gives up reconnecting and closes the client, the next call opens a
   new connection and restores this loop's subscriptions on it.
 
