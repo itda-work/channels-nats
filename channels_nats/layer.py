@@ -217,6 +217,10 @@ class NatsChannelLayer(BaseChannelLayer):
         self.connect_options = dict(connect_options or {})
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
         self._warned_about_loops = False
+        #: Loops that closed while their connection was still open. Counted because
+        #: the layer cannot close it for them -- see ``_forget_closed_loops``.
+        self._orphaned_connections = 0
+        self._orphan_warned_at: float | None = None
 
     # ------------------------------------------------------------------ plumbing
 
@@ -253,8 +257,36 @@ class NatsChannelLayer(BaseChannelLayer):
         return self._states.get(asyncio.get_running_loop())
 
     def _forget_closed_loops(self) -> None:
+        """Drop the state of loops that have closed, and report what went with it.
+
+        The connection of a closed loop cannot be released from here: its transport
+        belongs to that loop, ``writer.close()`` raises "Event loop is closed" and
+        ``transport.abort()`` schedules work that will never run (both measured). So
+        it is held until the garbage collector takes the client, and the only useful
+        thing this can do is say how many there have been.
+
+        ``loop_state_warn_at`` does not cover this. It watches how many states exist,
+        and these are pruned right here -- a process that opens a loop per call keeps
+        that count at one while the connections pile up on the server.
+        """
         for closed in [loop for loop in self._states if loop.is_closed()]:
-            del self._states[closed]
+            state = self._states.pop(closed)
+            if state.client is not None and not state.client.is_closed:
+                self._orphaned_connections += 1
+        if not self._orphaned_connections:
+            return
+        now = time.monotonic()
+        if self._orphan_warned_at is not None and now - self._orphan_warned_at < self.drop_log_interval:
+            return
+        self._orphan_warned_at = now
+        log.warning(
+            "channels_nats: %d event loop(s) closed while still holding a NATS connection. "
+            "A connection belongs to the loop that opened it, so this one cannot be closed "
+            "from here -- it goes when the garbage collector takes it. Calling the layer "
+            "through async_to_sync does this once per call; keep a loop, or reach the layer "
+            "from async code.",
+            self._orphaned_connections,
+        )
 
     async def _client(self) -> Client:
         state = self._state()

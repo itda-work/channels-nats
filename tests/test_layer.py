@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import gc
 import logging
 import time
 
@@ -1336,3 +1337,38 @@ async def test_a_group_subscription_goes_when_its_last_process_channel_leaves(la
 
     await layer.group_send("room", {"type": "test.message"})
     assert await asyncio.wait_for(reading, 5) == {"type": "test.message"}
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_loop_that_closes_while_holding_a_connection_is_reported(nats_url, caplog):
+    """The layer cannot close that connection, so it has to say so.
+
+    Connections are per event loop. A loop that closes takes its own state with it
+    and the connection is left to the garbage collector -- measured: neither
+    ``writer.close()`` nor ``transport.abort()`` releases it once the loop is gone.
+    ``loop_state_warn_at`` does not catch this: those states are pruned, so the count
+    it watches stays low. Twenty ``async_to_sync`` calls left seventeen connections
+    open on the server and no warning at all.
+    """
+    layer = NatsChannelLayer(servers=nats_url)
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        for _ in range(2):
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(layer.group_send("room", {"type": "test.message"}))
+            finally:
+                loop.close()
+        asyncio.run(layer.group_send("room", {"type": "test.message"}))  # notices them
+        orphaned = layer._orphaned_connections
+
+    # Collect here rather than leaving it to land in some later test: the abandoned
+    # client's own tasks are reported as destroyed while pending when it goes, which
+    # is the same leak this test is about.
+    del layer
+    gc.collect()
+
+    reported = [record.message for record in caplog.records if "closed while still holding" in record.message]
+    assert reported, [record.message for record in caplog.records]
+    # Both were counted; the warning is rate-limited like the other drop reports, so the
+    # second is carried by the count rather than by a second line.
+    assert orphaned == 2
