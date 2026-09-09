@@ -699,3 +699,89 @@ def test_process_subject_is_derived_from_the_channel_prefix():
     layer = NatsChannelLayer(prefix="app")
     assert layer.channel_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
     assert layer.process_subject("specific.abc123!deadbeef") == "app.pc.specific.abc123"
+
+
+async def test_a_cancelled_subscribe_does_not_steal_from_the_next_one(layer, make_layer):
+    """A subscription left behind by a cancelled subscribe keeps taking messages.
+
+    ``Client.subscribe()`` registers the subscription and starts its callback task
+    before it awaits the wire, so a cancellation inside it never hands the caller
+    a Subscription to take down. A plain channel is read under a queue group, so
+    that leftover stays a member of it: the server keeps giving it messages, its
+    callback files them in a mailbox nobody can reach any more, and the reader
+    that retried sees only the rest.
+
+    The cancel point is injected -- whether normal use reaches it depends on
+    nats-py internals -- and reaching into ``_send_subscribe`` ties this test to
+    them. What it pins is the layer's side: cancellation must not leave a live
+    subscription behind.
+    """
+    client = await layer._client()
+    subscribed, resume = asyncio.Event(), asyncio.Event()
+    send_subscribe = client._send_subscribe
+
+    async def gated(*args, **kwargs):
+        result = await send_subscribe(*args, **kwargs)
+        await client.flush()  # cancel only once the server has the subscription
+        subscribed.set()
+        await resume.wait()
+        return result
+
+    client._send_subscribe = gated
+    try:
+        subscribing = asyncio.create_task(layer._mailbox("shared"))
+        await asyncio.wait_for(subscribed.wait(), 5)
+        subscribing.cancel()
+        resume.set()
+        with pytest.raises(asyncio.CancelledError):
+            await subscribing
+    finally:
+        client._send_subscribe = send_subscribe
+
+    await layer._mailbox("shared")  # the retry, which subscribes again -- and only now is there a reader
+    sender = make_layer()
+    for index in range(20):
+        await sender.send("shared", {"type": "chat", "index": index})
+    delivered = [(await asyncio.wait_for(layer.receive("shared"), 5))["index"] for _ in range(20)]
+    assert delivered == list(range(20))
+
+
+async def test_a_cancelled_flush_leaves_no_unconfirmed_subscription(layer):
+    """The process subscription is established only once the server has it.
+
+    ``_process_subscription`` used to record the subscription before flushing.
+    A cancellation in that flush deleted the mailbox but kept the record, so the
+    next caller took the "already subscribed" early return and nothing ever
+    confirmed the SUB. Whether the server had already received it decides whether
+    messages are lost, which is what made that gap conditional; what is not
+    conditional is that the attempt must not leave a subscription on the
+    connection that no caller holds.
+    """
+    client = await layer._client()
+    flushing, resume = asyncio.Event(), asyncio.Event()
+    flush = client.flush
+
+    async def gated(*args, **kwargs):
+        flushing.set()
+        await resume.wait()
+        return await flush(*args, **kwargs)
+
+    client.flush = gated
+    try:
+        opening = asyncio.create_task(layer.new_channel())
+        await asyncio.wait_for(flushing.wait(), 5)
+        opening.cancel()
+        resume.set()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+    finally:
+        client.flush = flush
+
+    process_subject = f"{layer.prefix}.pc.specific.{layer._state().client_id}"
+    assert [s for s in client._subs.values() if s.subject == process_subject] == []
+    assert layer._state().process_subscriptions == {}
+
+    # And the retry really does establish it: a message from elsewhere arrives.
+    channel = await layer.new_channel()
+    await layer.send(channel, {"type": "after"})
+    assert await asyncio.wait_for(layer.receive(channel), 5) == {"type": "after"}

@@ -266,7 +266,7 @@ class NatsChannelLayer(BaseChannelLayer):
         # up back on the server, and it would keep delivering.
         stale: list[Subscription] = []
         for subject in list(state.process_subscriptions):
-            subscription = await client.subscribe(subject, cb=self._process_deliver(state))
+            subscription = await self._subscribe(client, subject, cb=self._process_deliver(state))
             if subject in state.process_subscriptions:
                 state.process_subscriptions[subject] = subscription
             else:
@@ -274,7 +274,8 @@ class NatsChannelLayer(BaseChannelLayer):
         for channel, box in list(state.mailboxes.items()):
             if box.subscription is None:
                 continue
-            subscription = await client.subscribe(
+            subscription = await self._subscribe(
+                client,
                 self.channel_subject(channel),
                 queue=self.channel_queue_group(channel),
                 cb=self._channel_deliver(box, channel),
@@ -284,13 +285,16 @@ class NatsChannelLayer(BaseChannelLayer):
             else:
                 stale.append(subscription)
         for group in list(state.group_subscriptions):
-            subscription = await client.subscribe(self.group_subject(group), cb=self._group_deliver(state, group))
+            subscription = await self._subscribe(
+                client, self.group_subject(group), cb=self._group_deliver(state, group)
+            )
             if group in state.group_subscriptions:
                 state.group_subscriptions[group] = subscription
             else:
                 stale.append(subscription)
         for group, channel in list(state.group_channel_subscriptions):
-            subscription = await client.subscribe(
+            subscription = await self._subscribe(
+                client,
                 self.group_subject(group),
                 queue=self.channel_queue_group(channel),
                 cb=self._group_channel_deliver(state, channel),
@@ -365,6 +369,45 @@ class NatsChannelLayer(BaseChannelLayer):
                     self._enqueue(box, member, msg.data)
 
         return deliver
+
+    async def _subscribe(self, client: Client, subject: str, cb: t.Callable, queue: str = "") -> Subscription:
+        """Subscribe so that a cancellation cannot leave a subscription behind.
+
+        ``Client.subscribe()`` registers the subscription and starts its callback
+        task before it awaits the wire, so a cancellation inside it never hands
+        back the ``Subscription`` -- and what the caller never receives, it cannot
+        take down. The leftover keeps delivering: under a queue group it takes
+        messages away from the subscription that replaces it and files them in a
+        mailbox nobody can reach, and on a process or group subject it delivers
+        every message a second time.
+
+        Running it as a task keeps the handle reachable either way, so the caller
+        can unsubscribe on the way out. A second cancellation arriving while we
+        wait for it does leak -- there is nowhere left to wait.
+        """
+        subscribing = asyncio.ensure_future(client.subscribe(subject, queue=queue, cb=cb))
+        try:
+            return await asyncio.shield(subscribing)
+        except BaseException:
+            try:
+                leftover = await subscribing
+            except Exception:
+                pass  # it never came up, so there is nothing to take down
+            else:
+                await self._unsubscribe([leftover])
+            raise
+
+    async def _flush_or_undo(self, client: Client, subscription: Subscription) -> None:
+        """Wait for the server to have the subscription, or take it back down.
+
+        A subscription whose flush was cancelled is live and unaccounted for; the
+        caller is about to fail, so it must not be left on the connection.
+        """
+        try:
+            await client.flush()
+        except BaseException:
+            await self._unsubscribe([subscription])
+            raise
 
     async def _unsubscribe(self, subscriptions: t.Iterable[Subscription]) -> None:
         """Drop subscriptions, tolerating a connection that has already gone.
@@ -494,7 +537,8 @@ class NatsChannelLayer(BaseChannelLayer):
                     await self._process_subscription(channel)
                 else:
                     client = await self._client()
-                    box.subscription = await client.subscribe(
+                    box.subscription = await self._subscribe(
+                        client,
                         self.channel_subject(channel),
                         queue=self.channel_queue_group(channel),
                         cb=self._channel_deliver(box, channel),
@@ -521,8 +565,12 @@ class NatsChannelLayer(BaseChannelLayer):
         if subject in state.process_subscriptions:
             return
         client = await self._client()
-        state.process_subscriptions[subject] = await client.subscribe(subject, cb=self._process_deliver(state))
-        await client.flush()
+        subscription = await self._subscribe(client, subject, cb=self._process_deliver(state))
+        await self._flush_or_undo(client, subscription)
+        # Recorded only once the server has it. Recording first and flushing after
+        # left a cancelled flush looking established: the entry stayed, the next
+        # caller took the early return above, and nothing ever confirmed the SUB.
+        state.process_subscriptions[subject] = subscription
 
     # ------------------------------------------------------------------ channels
 
@@ -652,21 +700,25 @@ class NatsChannelLayer(BaseChannelLayer):
                 if group in state.group_subscriptions:
                     return
                 client = await self._client()
-                state.group_subscriptions[group] = await client.subscribe(
-                    self.group_subject(group), cb=self._group_deliver(state, group)
+                subscription = await self._subscribe(
+                    client, self.group_subject(group), cb=self._group_deliver(state, group)
                 )
+                await self._flush_or_undo(client, subscription)
+                state.group_subscriptions[group] = subscription
             else:
                 # A plain channel read by several processes is still one channel, so
                 # take the group's messages for it under the channel's queue group.
                 if (group, channel) in state.group_channel_subscriptions:
                     return
                 client = await self._client()
-                state.group_channel_subscriptions[group, channel] = await client.subscribe(
+                subscription = await self._subscribe(
+                    client,
                     self.group_subject(group),
                     queue=self.channel_queue_group(channel),
                     cb=self._group_channel_deliver(state, channel),
                 )
-            await client.flush()
+                await self._flush_or_undo(client, subscription)
+                state.group_channel_subscriptions[group, channel] = subscription
 
     async def group_discard(self, group: str, channel: str) -> None:
         self.require_valid_group_name(group)
