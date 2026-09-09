@@ -30,7 +30,12 @@ jobs:
       - name: Install nats-server (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -sL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          # -f and a file rather than a pipe: a download that fails otherwise reaches
+          # tar as an error page, and the job dies on "not in gzip format" instead of
+          # saying what went wrong. Seen once.
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/nats.tar.gz" \
+            "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          tar xzf "$RUNNER_TEMP/nats.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nats-server-${NATS_VERSION}-linux-amd64" >> "$GITHUB_PATH"
 
       - name: Install nats-server (Windows)
@@ -38,6 +43,7 @@ jobs:
         shell: pwsh
         run: |
           $name = "nats-server-$env:NATS_VERSION-windows-amd64"
+          $ProgressPreference = "SilentlyContinue"
           Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$env:NATS_VERSION/$name.zip" -OutFile "$env:RUNNER_TEMP\nats.zip"
           Expand-Archive -Path "$env:RUNNER_TEMP\nats.zip" -DestinationPath $env:RUNNER_TEMP
           "$env:RUNNER_TEMP\$name" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
