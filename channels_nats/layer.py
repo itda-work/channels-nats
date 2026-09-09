@@ -991,9 +991,14 @@ class NatsChannelLayer(BaseChannelLayer):
             return
         members.discard(channel)
         stale = [state.group_channel_subscriptions.pop((group, channel), None)]
+        if not any("!" in member for member in members):
+            # The group subscription is there for this process's own channels; a
+            # plain member is served by its own queue subscription instead. Held past
+            # the last one, it takes delivery of everything the group publishes only
+            # to drop it -- traffic this connection pays for, pending limits included.
+            stale.append(state.group_subscriptions.pop(group, None))
         if not members:
             del state.groups[group]
-            stale.append(state.group_subscriptions.pop(group, None))
         await self._unsubscribe([s for s in stale if s is not None])
 
     async def group_send(self, group: str, message: Message) -> None:

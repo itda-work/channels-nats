@@ -1309,3 +1309,30 @@ async def test_a_plain_channel_in_a_group_survives_a_reconnect(make_layer, caplo
         for reader in readers:
             reader.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
+
+
+async def test_a_group_subscription_goes_when_its_last_process_channel_leaves(layer):
+    """The group subscription serves this process's own channels, nothing else.
+
+    A plain member is served by its own queue subscription, so once the last
+    channel with a "!" leaves, the group subscription has nobody left to deliver to
+    -- and every message published to that group still arrives, is handed to a
+    callback that drops all of it, and counts against the connection's pending
+    limits on the way (confirmed on the server's /subsz: the subscription stayed).
+    """
+    channel = await layer.new_channel()
+    reading = asyncio.create_task(layer.receive("shared"))
+    await asyncio.sleep(0.1)
+    await layer.group_add("room", channel)
+    await layer.group_add("room", "shared")
+    state = layer._state()
+    subscription = state.group_subscriptions["room"]
+
+    await layer.group_discard("room", channel)
+
+    assert "room" not in state.group_subscriptions, "the group subscription has nobody to deliver to"
+    assert subscription._closed, "it was dropped from the records but left on the connection"
+    assert ("room", "shared") in state.group_channel_subscriptions, "the plain member lost its subscription"
+
+    await layer.group_send("room", {"type": "test.message"})
+    assert await asyncio.wait_for(reading, 5) == {"type": "test.message"}
