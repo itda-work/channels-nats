@@ -5,7 +5,7 @@ description = "NATS-backed channel layer for Django Channels: one Go binary inst
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 authors = [{ name = "itda-work" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -13,9 +13,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
@@ -47,7 +44,7 @@ packages = ["channels_nats"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
@@ -59,7 +56,7 @@ known-first-party = ["channels_nats"]
 quote-style = "double"
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.13"
 include = ["channels_nats"]
 reportPrivateUsage = false
 

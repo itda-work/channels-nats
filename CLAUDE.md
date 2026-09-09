@@ -26,7 +26,7 @@ scripts/release_check.py  태그·CHANGELOG·분류자가 pyproject의 version�
 
 - 사용자 쪽 API를 늘리지 않는다. 옵션은 `CONFIG`로만.
 - subject 형식(`<prefix>.ch.<channel>`, `<prefix>.grp.<group>`)은 외부 계약이다. 바꾸면 README와 CHANGELOG에 남기고 메이저를 올린다.
-- Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. CI는 ubuntu(3.10·3.13·3.14)와 **windows-latest(3.13)**를 돈다. Windows 잡은 테스트만 돌린다 — lint·타입 검사는 플랫폼과 무관하고, Windows 체크아웃은 CRLF라 포맷 검사가 헛돈다. 여전히 CI 밖인 것: Windows에서의 **하한 버전(3.10)**과 **ARM Windows**. 0.2.1의 클러스터 레이스는 Windows에서만 났으니, 타이밍이나 경로에 민감한 변경은 그 두 축을 손으로 확인할 여지가 남는다(`windows-parallels-lab` 스킬).
+- Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. CI는 ubuntu(3.13·3.14)와 **windows-latest(3.13)**를 돈다 — 하한이 3.13이므로 Windows도 하한을 돈다. Windows 잡은 테스트만 돌린다: lint·타입 검사는 플랫폼과 무관하고, Windows 체크아웃은 CRLF라 포맷 검사가 헛돈다. CI 밖에 남는 축은 **ARM Windows** 하나다. 0.2.1의 클러스터 레이스는 Windows에서만 났으니 타이밍이나 경로에 민감한 변경은 손으로 확인한다(`windows-parallels-lab` 스킬).
 - 커밋 메시지는 영어 Conventional Commits. 문서는 한국어.
 - **작업 큐는 GitHub 이슈다.** 세션을 시작하면 `gh issue list`부터 본다. 결함을 발견하면 그 자리에서 고치거나 이슈로 남긴다 — 요약 말미의 "남은 것" 목록으로 넘기지 않는다. 이슈에는 재현 방법과 **검증 상태**(재현함 / 코드상 확인 / 미검증)를 적고, 심각도는 보수적으로 적는다.
 - **결함은 재현한 뒤에 말한다.** 코드를 읽고 추론한 것과 실제로 돌려 본 것을 구분해서 쓴다. 인터페이스 표면 비교(메서드가 다 있는지)로 "누락 없음"이라고 결론 내지 않는다 — 이 레이어의 실제 결함은 전부 동작에 있었다.
