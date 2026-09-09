@@ -1014,4 +1014,26 @@ class NatsChannelLayer(BaseChannelLayer):
         if state is not None and state.recovery is not None:
             state.recovery.cancel()
         if state is not None and state.client is not None and not state.client.is_closed:
-            await state.client.drain()
+            try:
+                await state.client.drain()
+            except Exception as error:
+                # Draining flushes what is pending, so a connection that cannot reach
+                # the server does not drain -- nats-py runs out its own drain_timeout
+                # and flush_timeout and raises. Tearing down must not become an error
+                # for the caller, and the connection must not be left open either, so
+                # it goes the hard way. How long this takes is nats-py's drain
+                # semantics, not ours: measured on a wedged connection at about 50s
+                # with its defaults (30 + 10) and about 14s with both lowered to 2 and
+                # 1 through `connect_options`.
+                log.warning(
+                    "channels_nats: could not drain the connection on close (%s); closing it instead. "
+                    "Whatever was still pending did not go out.",
+                    error,
+                )
+                try:
+                    # Bounded too: closing writes what is left and waits for the socket,
+                    # which is the very thing that is stuck. Past the grace the caller
+                    # goes on and the connection dies with the loop.
+                    await asyncio.wait_for(state.client.close(), CLEANUP_GRACE)
+                except (Exception, asyncio.TimeoutError) as closing_error:
+                    log.debug("channels_nats: could not close the connection: %s", closing_error)

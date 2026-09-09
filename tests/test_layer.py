@@ -5,6 +5,7 @@ import time
 import pytest
 from asgiref.sync import async_to_sync
 from channels.exceptions import MessageTooLarge
+from nats.errors import FlushTimeoutError
 
 from channels_nats import ChannelLayerClosed, NatsChannelLayer
 
@@ -1102,3 +1103,25 @@ async def test_a_cancelled_read_does_not_wait_out_a_jammed_unsubscribe(layer):
             await asyncio.wait_for(reading, 5)  # not "once the connection frees up"
     finally:
         release.set()
+
+
+async def test_close_survives_a_connection_that_cannot_be_drained(layer, caplog):
+    """Draining flushes what is pending, so a jammed connection cannot be drained.
+
+    nats-py gives up after its own ``drain_timeout``/``flush_timeout`` and raises
+    ``FlushTimeoutError`` -- measured against a real server whose reader was stopped:
+    ``close()`` came back after 24 seconds with that exception, and after 12 with both
+    timeouts lowered. Tearing down must not become an error for the caller, so the
+    connection is closed the hard way instead.
+    """
+    client = await layer._client()
+
+    async def failing_drain():
+        raise FlushTimeoutError
+
+    client.drain = failing_drain
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        await layer.close()  # must not raise
+
+    assert client.is_closed, "the connection has to go even when it cannot be drained"
+    assert any("could not drain" in record.message for record in caplog.records)
