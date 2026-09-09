@@ -531,7 +531,13 @@ class NatsChannelLayer(BaseChannelLayer):
         connection goes with it, and so do its subscriptions.
         """
         task = asyncio.ensure_future(work)
-        state = self._state()
+        state = self._state_if_open()
+        if state is None:
+            # close() already took this loop's state, and the connection with it, so
+            # the command has nothing left to reach. Asking _state() for somewhere to
+            # keep the task would revive the loop the caller has just closed (#24).
+            task.cancel()
+            return
         state.cleanups.add(task)
         task.add_done_callback(state.cleanups.discard)
 

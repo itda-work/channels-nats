@@ -1125,3 +1125,64 @@ async def test_close_survives_a_connection_that_cannot_be_drained(layer, caplog)
 
     assert client.is_closed, "the connection has to go even when it cannot be drained"
     assert any("could not drain" in record.message for record in caplog.records)
+
+
+async def test_handing_a_command_off_does_not_revive_a_closed_loop(layer):
+    """The cleanup handoff must not do what #24 was about.
+
+    ``_finish_later()`` keeps the task on the loop's state so nothing is left
+    pending at loop shutdown -- but reaching for that state through ``_state()``
+    creates one when ``close()`` has just taken it away, and the revived entry
+    counts towards ``loop_state_warn_at`` while holding nothing.
+    """
+    client = await layer._client()
+    original, started, release = client.subscribe, asyncio.Event(), asyncio.Event()
+
+    async def parked_subscribe(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    client.subscribe = parked_subscribe
+    try:
+        opening = asyncio.create_task(layer._mailbox("channel-being-subscribed"))
+        await asyncio.wait_for(started.wait(), 5)
+
+        await layer.close()  # the state goes
+        opening.cancel()  # and the cleanup, which cannot finish, is handed off
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(opening, 5)
+
+        assert layer._states == {}
+    finally:
+        release.set()
+        client.subscribe = original
+
+
+async def test_close_finishes_the_commands_it_cancelled(layer):
+    """A cancelled task is not a finished one until the loop has run it.
+
+    ``close()`` cancels the commands it handed to the background; if it returns
+    before they have taken the cancellation, a loop that closes right after prints
+    "Task was destroyed but it is pending!" for each one.
+    """
+    box = await layer._mailbox("plain-with-a-parked-unsubscribe")
+    release = asyncio.Event()
+    original = box.subscription.unsubscribe
+
+    async def parked_unsubscribe(*args, **kwargs):
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    box.subscription.unsubscribe = parked_unsubscribe
+    try:
+        state = layer._state()
+        await layer._unsubscribe([box.subscription])  # gives up waiting, hands it off
+        handed_off = set(state.cleanups)
+        assert handed_off, "the parked unsubscribe should have been handed off"
+
+        await layer.close()
+
+        assert all(task.done() for task in handed_off), "close() left a task mid-cancellation"
+    finally:
+        release.set()
