@@ -81,6 +81,34 @@ async def test_ordering_holds_within_one_subscription(make_layer):
     assert [(await asyncio.wait_for(worker.receive(grouped), 5))["n"] for _ in range(20)] == list(range(20))
 
 
+async def test_a_cancelled_group_add_leaves_no_membership_behind(make_layer):
+    """A membership with no subscription receives nothing and keeps the mailbox alive.
+
+    group_add records the member before it has the group's subscription, so a
+    cancellation in between used to leave one that nothing feeds.
+    """
+    worker = make_layer()
+    channel = await worker.new_channel()  # its mailbox exists, so group_add gets to the lock
+    state = worker._state()
+
+    await state.subscribe_lock.acquire()
+    adding = asyncio.create_task(worker.group_add("room", channel))
+    await asyncio.sleep(0)  # let it record the membership and block on the lock
+    adding.cancel()
+    state.subscribe_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await adding
+
+    assert channel not in state.groups.get("room", set())
+
+    receiving = asyncio.create_task(worker.receive(channel))
+    await asyncio.sleep(0.1)
+    receiving.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await receiving
+    assert channel not in state.mailboxes  # a phantom membership would have held it
+
+
 async def test_group_discard_stops_delivery(layer):
     channel = await layer.new_channel()
     await layer.group_add("room", channel)

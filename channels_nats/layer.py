@@ -563,7 +563,31 @@ class NatsChannelLayer(BaseChannelLayer):
         self.require_valid_channel_name(channel)
         state = self._state()
         await self._mailbox(channel)
-        state.groups.setdefault(group, set()).add(channel)
+        # The member goes in before the subscription, so that a message arriving the
+        # moment the subscription comes up already has somewhere to go. The cost is
+        # that a failure here has to take it back out again.
+        members = state.groups.setdefault(group, set())
+        members.add(channel)
+        try:
+            await self._group_subscribe(state, group, channel)
+        except BaseException:
+            if not self._group_delivers_to(state, group, channel):
+                # Nothing feeds this membership, and _discard_mailbox would read it
+                # as "still in use" and keep the mailbox for the life of the process.
+                # A racing group_add that did succeed shares this very entry, which
+                # is why the subscription, not our own bookkeeping, decides.
+                members.discard(channel)
+                if not members:
+                    state.groups.pop(group, None)
+            raise
+
+    def _group_delivers_to(self, state: _LoopState, group: str, channel: str) -> bool:
+        """Whether a subscription that would feed ``channel`` for ``group`` exists."""
+        if "!" in channel:
+            return group in state.group_subscriptions
+        return (group, channel) in state.group_channel_subscriptions
+
+    async def _group_subscribe(self, state: _LoopState, group: str, channel: str) -> None:
         async with state.subscribe_lock:  # racing group_add calls must share one subscription
             if "!" in channel:
                 if group in state.group_subscriptions:
