@@ -1,6 +1,6 @@
 [project]
 name = "channels-nats"
-version = "0.2.4"
+version = "0.3.0"
 description = "NATS-backed channel layer for Django Channels: one Go binary instead of Redis, Windows-friendly"
 readme = "README.md"
 license = "MIT"
@@ -21,17 +21,16 @@ classifiers = [
 ]
 dependencies = [
     "channels>=4.2.1,<5",
+    "msgpack>=1.0",
     "nats-py>=2.6,<3",
 ]
 
 [project.optional-dependencies]
-msgpack = ["msgpack>=1.0"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff",
     "pyright",
-    "msgpack>=1.0",
     "django>=4.2",
 ]
 

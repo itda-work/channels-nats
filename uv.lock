@@ -43,10 +43,11 @@ wheels = [
 
 [[package]]
 name = "channels-nats"
-version = "0.2.4"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "channels" },
+    { name = "msgpack" },
     { name = "nats-py" },
 ]
 
@@ -54,29 +55,24 @@ dependencies = [
 dev = [
     { name = "django", version = "5.2.17", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "django", version = "6.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "msgpack" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-]
-msgpack = [
-    { name = "msgpack" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "channels", specifier = ">=4.2.1,<5" },
     { name = "django", marker = "extra == 'dev'", specifier = ">=4.2" },
-    { name = "msgpack", marker = "extra == 'dev'", specifier = ">=1.0" },
-    { name = "msgpack", marker = "extra == 'msgpack'", specifier = ">=1.0" },
+    { name = "msgpack", specifier = ">=1.0" },
     { name = "nats-py", specifier = ">=2.6,<3" },
     { name = "pyright", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
-provides-extras = ["msgpack", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "colorama"

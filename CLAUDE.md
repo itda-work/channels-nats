@@ -16,7 +16,7 @@
 channels_nats/
 ├── __init__.py       NatsChannelLayer 재export
 ├── layer.py          레이어 본체. 이벤트 루프별 연결, 채널별 로컬 mailbox, 그룹당 구독 하나
-└── serializers.py    json 기본, msgpack 선택
+└── serializers.py    msgpack 고정. 형식은 프로세스 간 계약이라 옵션이 아니다
 tests/                nats-server 바이너리를 띄우는 통합 테스트 (NATS_SERVER, PATH, ~/go/bin 순서로 탐색)
 bench/fanout.py       group_send fan-out 지연·처리량. InMemory 레이어와 비교
 scripts/release_check.py  태그·CHANGELOG·분류자가 pyproject의 version과 맞는지

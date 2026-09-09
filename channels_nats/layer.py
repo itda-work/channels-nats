@@ -44,11 +44,12 @@ import uuid
 from dataclasses import dataclass, field
 
 import nats
+from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
 from nats.aio.subscription import Subscription
 
-from .serializers import Serializer, get_serializer
+from . import serializers
 
 log = logging.getLogger("channels_nats")
 
@@ -76,6 +77,9 @@ class _LoopState:
     mailboxes: dict[str, _Mailbox] = field(default_factory=dict)
     groups: dict[str, set[str]] = field(default_factory=dict)
     group_subscriptions: dict[str, Subscription] = field(default_factory=dict)
+    #: (group, plain channel) -> a queue subscription on that group's subject, so a
+    #: channel name several processes read gets each message once, not once each.
+    group_channel_subscriptions: dict[tuple[str, str], Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
 
@@ -95,6 +99,11 @@ class NatsChannelLayer(BaseChannelLayer):
 
     extensions = ["groups", "flush"]
 
+    #: The spec asks a layer to carry these. ``ChannelFull`` is never raised here:
+    #: over pub/sub a sender cannot see the receiver's queue (see the README).
+    MessageTooLarge = MessageTooLarge
+    ChannelFull = ChannelFull
+
     #: A full mailbox stays full, so warn about the first drop and then at most
     #: this often, rather than once per message.
     drop_log_interval = 60.0
@@ -112,7 +121,6 @@ class NatsChannelLayer(BaseChannelLayer):
         group_expiry: int = 86400,
         capacity: int = 100,
         channel_capacity: t.Any = None,
-        serializer: str | Serializer = "json",
         connect_options: dict[str, t.Any] | None = None,
     ) -> None:
         super().__init__(expiry=expiry, capacity=capacity, channel_capacity=channel_capacity)
@@ -123,7 +131,6 @@ class NatsChannelLayer(BaseChannelLayer):
         self.servers = [servers] if isinstance(servers, str) else list(servers)
         self.prefix = prefix
         self.group_expiry = group_expiry
-        self.serializer = get_serializer(serializer)
         self.connect_options = dict(connect_options or {})
         self.client_id = uuid.uuid4().hex[:12]
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
@@ -222,6 +229,12 @@ class NatsChannelLayer(BaseChannelLayer):
             state.group_subscriptions[group] = await client.subscribe(
                 self.group_subject(group), cb=self._group_deliver(state, group)
             )
+        for group, channel in list(state.group_channel_subscriptions):
+            state.group_channel_subscriptions[group, channel] = await client.subscribe(
+                self.group_subject(group),
+                queue=self.channel_queue_group(channel),
+                cb=self._group_channel_deliver(state, channel),
+            )
         await client.flush()
         log.warning(
             "channels_nats: the NATS connection was closed; reconnected and restored %d subscriptions",
@@ -262,7 +275,7 @@ class NatsChannelLayer(BaseChannelLayer):
 
     def _channel_deliver(self, box: _Mailbox, channel: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
         async def deliver(msg: t.Any) -> None:
-            self._enqueue(box, channel, self.serializer.loads(msg.data))
+            self._enqueue(box, channel, serializers.loads(msg.data))
 
         return deliver
 
@@ -273,21 +286,23 @@ class NatsChannelLayer(BaseChannelLayer):
                 return
             box = state.mailboxes.get(target)
             if box is not None:
-                self._enqueue(box, target, self.serializer.loads(msg.data))
+                self._enqueue(box, target, serializers.loads(msg.data))
 
         return deliver
 
     def _group_deliver(self, state: _LoopState, group: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
         async def deliver(msg: t.Any) -> None:
-            message = self.serializer.loads(msg.data)
+            message = serializers.loads(msg.data)
             first = True
             for member in list(state.groups.get(group, ())):
+                if "!" not in member:
+                    continue  # plain channels come in on their own queue subscription
                 box = state.mailboxes.get(member)
                 if box is None:
                     continue
                 # Every member gets its own object. Handing one dict to several
                 # consumers lets one of them edit what the others receive.
-                self._enqueue(box, member, message if first else self.serializer.loads(msg.data))
+                self._enqueue(box, member, message if first else serializers.loads(msg.data))
                 first = False
 
         return deliver
@@ -303,6 +318,39 @@ class NatsChannelLayer(BaseChannelLayer):
                 await subscription.unsubscribe()
             except Exception as error:
                 log.debug("channels_nats: could not unsubscribe: %s", error)
+
+    def _group_channel_deliver(self, state: _LoopState, channel: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
+        async def deliver(msg: t.Any) -> None:
+            box = state.mailboxes.get(channel)
+            if box is not None:
+                self._enqueue(box, channel, serializers.loads(msg.data))
+
+        return deliver
+
+    def _frame_size(self, payload: bytes, headers: dict[str, str] | None) -> int:
+        """What the server weighs against ``max_payload``.
+
+        nats-py only checks the payload, so a body just under the limit plus a
+        header goes out, and the server answers by closing the connection --
+        taking every other channel on it down too.
+        """
+        if headers is None:
+            return len(payload)
+        overhead = len(b"NATS/1.0") + 2 + 2  # the version line and the blank line after the headers
+        for key, value in headers.items():
+            overhead += len(key) + 2 + len(value) + 2  # "key: value\r\n"
+        return len(payload) + overhead
+
+    async def _publish(self, subject: str, message: Message, headers: dict[str, str] | None = None) -> None:
+        payload = serializers.dumps(message)
+        client = await self._client()
+        size = self._frame_size(payload, headers)
+        if size > client.max_payload:
+            raise MessageTooLarge(
+                f"message is {size} bytes on the wire, over the server's max_payload of "
+                f"{client.max_payload}; raise max_payload on nats-server or send less"
+            )
+        await client.publish(subject, payload, headers=headers)
 
     def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
         now = time.monotonic()
@@ -391,9 +439,8 @@ class NatsChannelLayer(BaseChannelLayer):
         assert isinstance(message, dict), "message is not a dict"
         self.require_valid_channel_name(channel)
         assert "__asgi_channel__" not in message, "Reserved key '__asgi_channel__' in message"
-        client = await self._client()
         headers = {self.CHANNEL_HEADER: channel} if "!" in channel else None
-        await client.publish(self.channel_subject(channel), self.serializer.dumps(message), headers=headers)
+        await self._publish(self.channel_subject(channel), message, headers)
 
     async def receive(self, channel: str) -> Message:
         self.require_valid_channel_name(channel)
@@ -431,6 +478,9 @@ class NatsChannelLayer(BaseChannelLayer):
         for group in [g for g, members in state.groups.items() if channel in members]:
             members = state.groups[group]
             members.discard(channel)
+            gone = state.group_channel_subscriptions.pop((group, channel), None)
+            if gone is not None:
+                stale.append(gone)
             if not members:
                 del state.groups[group]
                 subscription = state.group_subscriptions.pop(group, None)
@@ -453,11 +503,25 @@ class NatsChannelLayer(BaseChannelLayer):
         state = self._state()
         await self._mailbox(channel)
         state.groups.setdefault(group, set()).add(channel)
-        if group not in state.group_subscriptions:
-            client = await self._client()
-            state.group_subscriptions[group] = await client.subscribe(
-                self.group_subject(group), cb=self._group_deliver(state, group)
-            )
+        async with state.subscribe_lock:  # racing group_add calls must share one subscription
+            if "!" in channel:
+                if group in state.group_subscriptions:
+                    return
+                client = await self._client()
+                state.group_subscriptions[group] = await client.subscribe(
+                    self.group_subject(group), cb=self._group_deliver(state, group)
+                )
+            else:
+                # A plain channel read by several processes is still one channel, so
+                # take the group's messages for it under the channel's queue group.
+                if (group, channel) in state.group_channel_subscriptions:
+                    return
+                client = await self._client()
+                state.group_channel_subscriptions[group, channel] = await client.subscribe(
+                    self.group_subject(group),
+                    queue=self.channel_queue_group(channel),
+                    cb=self._group_channel_deliver(state, channel),
+                )
             await client.flush()
 
     async def group_discard(self, group: str, channel: str) -> None:
@@ -468,17 +532,16 @@ class NatsChannelLayer(BaseChannelLayer):
         if members is None:
             return
         members.discard(channel)
+        stale = [state.group_channel_subscriptions.pop((group, channel), None)]
         if not members:
             del state.groups[group]
-            subscription = state.group_subscriptions.pop(group, None)
-            if subscription is not None:
-                await self._unsubscribe([subscription])
+            stale.append(state.group_subscriptions.pop(group, None))
+        await self._unsubscribe([s for s in stale if s is not None])
 
     async def group_send(self, group: str, message: Message) -> None:
         assert isinstance(message, dict), "message is not a dict"
         self.require_valid_group_name(group)
-        client = await self._client()
-        await client.publish(self.group_subject(group), self.serializer.dumps(message))
+        await self._publish(self.group_subject(group), message)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -487,10 +550,12 @@ class NatsChannelLayer(BaseChannelLayer):
         state = self._state()
         stale = [
             *state.group_subscriptions.values(),
+            *state.group_channel_subscriptions.values(),
             *(box.subscription for box in state.mailboxes.values() if box.subscription is not None),
             *state.process_subscriptions.values(),
         ]
         state.group_subscriptions.clear()
+        state.group_channel_subscriptions.clear()
         state.process_subscriptions.clear()
         state.mailboxes.clear()
         state.groups.clear()

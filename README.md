@@ -33,8 +33,7 @@ Go 툴체인이 있으면 어느 OS에서든 `go install github.com/nats-io/nats
 ## 설치
 
 ```bash
-pip install channels-nats            # 또는 uv add channels-nats
-pip install "channels-nats[msgpack]" # bytes를 실어 보내야 하면
+pip install channels-nats  # 또는 uv add channels-nats
 ```
 
 서버는 `nats-server -p 4222`로 띄운다. 인증이 필요하면 `nats-server --auth <token>`과 `CONFIG: {"servers": ["nats://<token>@host:4222"]}`.
@@ -48,7 +47,6 @@ pip install "channels-nats[msgpack]" # bytes를 실어 보내야 하면
 | `expiry` | `60` | 초. 이보다 오래 대기한 메시지는 `receive`가 버린다 |
 | `capacity` | `100` | 채널당 로컬 대기열 크기. 넘치면 새 메시지를 버린다. 경고는 첫 드롭에 한 번, 이후 60초에 한 번, 대기열에 자리가 나면 누적 개수와 함께 한 번 |
 | `channel_capacity` | `None` | 채널 이름 패턴별 용량 (Channels 규약과 같음) |
-| `serializer` | `"json"` | `"json"` 또는 `"msgpack"` |
 | `connect_options` | `{}` | `nats.connect()`에 그대로 전달 (재접속, TLS 등) |
 
 ## Channels 규약과 다른 점
@@ -59,6 +57,9 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 - **`ChannelFull`은 발생하지 않는다.** 보내는 쪽은 상대 대기열을 모른다. 대신 받는 쪽이 넘치는 메시지를 버린다. `channels_redis`는 큐가 `capacity`를 넘으면 보내는 쪽에 이 예외를 던지므로, 그것을 잡던 코드는 여기서 아무 신호도 받지 못한다.
 - **버퍼가 있는 곳이 다르다.** `channels_redis`는 메시지를 Redis 안에 `expiry`(기본 60초)까지 보관하므로 받는 쪽이 아직 없어도 나중에 받는다. 이 레이어의 버퍼는 **받는 프로세스의 로컬 mailbox**이고 구독이 생긴 뒤에만 존재한다. 즉 "버퍼가 없다"가 아니라 "버퍼가 브로커가 아니라 구독자 안에 있다"가 정확하다.
 - **mailbox는 마지막 `receive()`가 취소될 때 사라진다.** 컨슈머가 끊기면 대기 중이던 `receive()`가 취소되고, 그것이 채널의 끝을 알 수 있는 유일한 신호다. 그때 mailbox와 (일반 채널이면) 그 구독을 정리한다.
+- **메시지 크기는 서버의 `max_payload`가 정한다.** 기본 1 MB이고 헤더까지 합산된다. 넘치면 `send`가 `MessageTooLarge`를 던진다(연결은 살아 있다). 더 큰 메시지가 필요하면 `nats-server`의 `max_payload`를 올린다.
+- **`flush()`는 부른 이벤트 루프의 상태만 지운다.** 스펙의 `flush` 확장은 분산 레이어가 모든 클라이언트에 비어 보이기를 요구하지만, 여기서는 다른 프로세스의 mailbox와 그룹은 남는다. 테스트에서 한 프로세스를 초기화하는 용도로만 쓴다.
+- **`capacity`는 프로세스 전용 채널마다 따로 적용된다.** 스펙은 `!` 앞부분(non-local part)에 공유 적용하라고 하지만, 그러면 연결이 많은 서버에서 서로의 대기열을 밀어낸다. 연결당 `capacity`로 유계이므로 프로세스 전체 상한은 연결 수 × `capacity`다.
 - **그룹 멤버십은 프로세스 안에 있다.** 프로세스가 죽으면 그 멤버십도 사라지므로 `group_expiry`는 형식상 유지된다. 다른 프로세스가 만든 채널로 `receive`나 `group_add`를 부르면 `ValueError`다. 그 채널로 `send`하는 것은 물론 된다.
 - **연결은 이벤트 루프마다 하나**다. Django 시그널이나 뷰에서 `async_to_sync(layer.group_send)`를 불러도 된다.
 
@@ -83,11 +84,11 @@ NATS는 저장 없는 at-most-once pub/sub이다. 이 레이어가 그 위에서
 |---------|------|
 | `<prefix>.pc.<process>` | 프로세스 전용 채널 `specific.<process>!<id>`로의 `send`. 전체 채널 이름은 NATS 헤더 `Channel`에 실리고, 받은 프로세스가 로컬에서 라우팅한다. 프로세스당 구독 하나 |
 | `<prefix>.ch.<channel>` | `!`가 없는 일반 채널로의 `send`. 채널당 구독 하나이고, subject와 같은 이름의 **큐 그룹**으로 구독한다. 그래서 여러 프로세스가 같은 채널 이름을 읽어도 메시지는 그중 하나에만 간다 |
-| `<prefix>.grp.<group>` | `group_send(group, message)`. 그룹에 멤버가 있는 프로세스마다 구독 하나 |
+| `<prefix>.grp.<group>` | `group_send(group, message)`. 프로세스 전용 멤버가 있는 프로세스마다 구독 하나. 일반 채널 멤버는 그 채널의 큐 그룹으로 따로 구독한다 |
 
-일반 채널의 큐 그룹도 계약의 일부다. `.ch.` subject에 합류하는 외부 워커가 큐 그룹 없이 그냥 구독하면 그 워커도 사본을 받아 단일 전달이 깨진다.
+일반 채널의 큐 그룹도 계약의 일부다. `.ch.`든 `.grp.`든 일반 채널의 메시지를 받으려는 외부 워커가 큐 그룹 없이 그냥 구독하면 그 워커도 사본을 받아 단일 전달이 깨진다.
 
-본문은 serializer로 직렬화한 Channels 메시지 dict다. 컨슈머 연결 하나의 비용은 로컬 대기열 하나이고 NATS 구독이 아니다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
+본문은 **msgpack**으로 직렬화한 Channels 메시지 dict다. Channels 메시지는 바이트열을 실을 수 있고 JSON은 그것을 표현하지 못한다. 형식은 모든 프로세스가 같아야 하므로 설정으로 두지 않는다 — 한 곳만 달라도 조용히 디코드에 실패한다. 컨슈머 연결 하나의 비용은 로컬 대기열 하나이고 NATS 구독이 아니다. 이 규약만 지키면 Go로 만든 WebSocket 프런트가 Python 없이도 같은 그룹에 뿌릴 수 있다. 그때도 Django 쪽 코드는 바뀌지 않는다.
 
 ## Windows 운영
 

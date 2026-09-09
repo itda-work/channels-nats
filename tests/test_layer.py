@@ -4,6 +4,7 @@ import time
 
 import pytest
 from asgiref.sync import async_to_sync
+from channels.exceptions import MessageTooLarge
 
 from channels_nats import NatsChannelLayer
 
@@ -349,6 +350,40 @@ async def test_a_receive_only_process_comes_back_after_the_connection_closes(mak
                 pytest.fail("the receive-only worker never came back")
 
 
+async def test_a_group_message_to_a_shared_channel_reaches_one_reader(make_layer):
+    """A channel is a queue on the group path too, not only on the direct one."""
+    workers = [make_layer(), make_layer()]
+    reading = [asyncio.create_task(worker.receive("shared-worker")) for worker in workers]
+    await asyncio.sleep(0.2)
+    for worker in workers:
+        await worker.group_add("jobs", "shared-worker")
+    await asyncio.sleep(0.2)
+
+    await make_layer().group_send("jobs", {"type": "job"})
+    await asyncio.sleep(0.4)
+
+    assert len([task for task in reading if task.done()]) == 1
+    for task in reading:
+        task.cancel()
+
+
+async def test_an_oversized_message_is_refused_without_killing_the_connection(make_layer):
+    """The server counts headers against max_payload; nats-py does not, and answers by hanging up."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    client = worker._state().client
+
+    # A body that fits on its own, but not once the Channel header is added.
+    body = b"x" * (client.max_payload - 60)
+    with pytest.raises(MessageTooLarge):
+        await worker.send(channel, {"type": "big", "body": body})
+
+    assert worker.MessageTooLarge is MessageTooLarge
+    assert not client.is_closed
+    await worker.send(channel, {"type": "small"})
+    assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "small"}
+
+
 async def test_invalid_names_are_rejected(layer):
     with pytest.raises(TypeError):
         await layer.group_send("bad*name", {"type": "x"})
@@ -358,11 +393,24 @@ async def test_invalid_names_are_rejected(layer):
         await layer.send("ok", {"__asgi_channel__": "x"})
 
 
-async def test_msgpack_serializer_keeps_bytes(make_layer):
-    packed = make_layer(serializer="msgpack")
-    channel = await packed.new_channel()
-    await packed.send(channel, {"type": "binary", "data": b"\x00\x01"})
-    assert await asyncio.wait_for(packed.receive(channel), 5) == {"type": "binary", "data": b"\x00\x01"}
+async def test_messages_carry_every_type_the_spec_allows(make_layer):
+    """Byte strings are in the spec's list, and JSON cannot represent them."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    message = {
+        "type": "spec.types",
+        "bytes": b"\x00\x01",
+        "text": "안녕",
+        "int": 2**62,
+        "float": 1.5,
+        "list": [1, "two", None],
+        "dict": {"nested": True},
+        "none": None,
+    }
+
+    await worker.send(channel, message)
+
+    assert await asyncio.wait_for(worker.receive(channel), 5) == message
 
 
 def test_subjects_are_the_contract():
