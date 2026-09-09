@@ -2,7 +2,7 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
-## [Unreleased]
+## [0.6.0] - 2026-09-09
 
 ### Fixed
 
