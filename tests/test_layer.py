@@ -872,3 +872,56 @@ async def test_errors_still_reach_the_nats_logger_without_an_error_cb(make_layer
         await asyncio.sleep(0.3)
 
     assert [record for record in caplog.records if record.name == "nats.aio.client"]
+
+
+async def test_receiving_on_the_process_prefix_gets_that_process_channels(make_layer):
+    """The spec models ``<name>.<id>!<random>`` with the part before ``!`` naming
+    the process, so a read on the prefix is a read on that process's channels.
+
+    Ordinary consumers pass the full name ``new_channel()`` gave them, which is
+    why this went unnoticed; a prefix read used to sit on a mailbox nothing ever
+    routed to.
+    """
+    owner = make_layer()
+    prefix = f"specific.{owner._state().client_id}!"
+    waiting = asyncio.create_task(owner.receive(prefix))
+    await asyncio.sleep(0.1)
+
+    sender = make_layer()
+    await sender.send(prefix + "aa11", {"type": "direct"})
+    assert await asyncio.wait_for(waiting, 5) == {"type": "direct"}
+
+
+async def test_a_channel_with_its_own_mailbox_is_not_taken_by_the_prefix(make_layer):
+    owner = make_layer()
+    channel = await owner.new_channel()
+    prefix = channel[: channel.index("!") + 1]
+    on_prefix = asyncio.create_task(owner.receive(prefix))
+    await asyncio.sleep(0.1)
+
+    sender = make_layer()
+    await sender.send(channel, {"type": "for the channel"})
+    assert await asyncio.wait_for(owner.receive(channel), 5) == {"type": "for the channel"}
+    assert not on_prefix.done()
+    on_prefix.cancel()
+
+
+async def test_a_frame_that_is_not_a_message_does_not_end_the_consumer(layer, caplog):
+    """Subjects are the contract, and the README invites other publishers to use
+    them. A frame that is not a msgpack map is the sender breaking that contract;
+    raising out of receive() would end a consumer that did nothing wrong.
+    """
+    await layer._mailbox("shared")
+    client = await layer._client()
+    subject = layer.channel_subject("shared")
+
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        await client.publish(subject, b"\x91\x01")  # msgpack, but an array
+        await client.publish(subject, b"\xc1")  # not msgpack at all
+        await asyncio.sleep(0.2)
+        await layer.send("shared", {"type": "good"})
+        assert await asyncio.wait_for(layer.receive("shared"), 5) == {"type": "good"}
+
+    warned = [r for r in caplog.records if "not a Channels message" in r.getMessage()]
+    assert len(warned) == 1  # rate-limited like the other drops
+    assert layer._state().bad_frames == 2

@@ -114,6 +114,10 @@ class _LoopState:
     #: no mailbox's ``dropped``. Per connection, which is what the limit is on.
     slow_consumer_drops: int = 0
     slow_consumer_warned_at: float | None = None
+    #: Frames that reached a mailbox but are not a Channels message. Only a
+    #: publisher other than this layer can produce one.
+    bad_frames: int = 0
+    bad_frame_warned_at: float | None = None
 
 
 class NatsChannelLayer(BaseChannelLayer):
@@ -397,6 +401,12 @@ class NatsChannelLayer(BaseChannelLayer):
             if not isinstance(target, str):
                 return
             box = state.mailboxes.get(target)
+            if box is None:
+                # The spec has the part before "!" name the process, so a read on
+                # the bare prefix is a read on that process's channels. Consumers
+                # pass the full name new_channel() gave them, which is why this is
+                # the fallback rather than the first lookup.
+                box = state.mailboxes.get(target[: target.index("!") + 1] if "!" in target else target)
             if box is not None:
                 self._enqueue(box, target, msg.data)
 
@@ -644,7 +654,10 @@ class NatsChannelLayer(BaseChannelLayer):
                     continue
                 if time.monotonic() - queued_at > self.expiry:
                     continue
-                return serializers.loads(payload)
+                message = self._decode(channel, payload)
+                if message is None:
+                    continue
+                return message
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -654,6 +667,39 @@ class NatsChannelLayer(BaseChannelLayer):
                 box.active_at = time.monotonic()  # the grace period starts here
                 if cancelled and "!" not in channel:
                     await self._discard_mailbox(channel, box)
+
+    def _decode(self, channel: str, payload: bytes) -> Message | None:
+        """Read a frame, or drop it and say so.
+
+        The subjects are the contract and the README invites other publishers to
+        use them, so a frame that is not a msgpack map is the sender breaking that
+        contract. Letting it out of ``receive()`` would end a consumer that did
+        nothing wrong -- and on a group subject one bad publish would end every
+        member -- so it is dropped like an expired message and reported instead.
+        Messages this layer sent are checked at ``send()``, which asserts a dict.
+        """
+        try:
+            message = serializers.loads(payload)
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+        else:
+            if isinstance(message, dict):
+                return message
+            reason = f"decoded to {type(message).__name__}, not a dict"
+        state = self._state()
+        state.bad_frames += 1
+        now = time.monotonic()
+        if state.bad_frame_warned_at is None or now - state.bad_frame_warned_at >= self.drop_log_interval:
+            state.bad_frame_warned_at = now
+            log.warning(
+                "channels_nats: dropped a frame on %s that is not a Channels message "
+                "(%s); %d so far. Something other than this layer is publishing to "
+                "its subjects.",
+                channel,
+                reason,
+                state.bad_frames,
+            )
+        return None
 
     def _sweep_mailboxes(self, state: _LoopState) -> None:
         """Forget the process channels whose consumers have gone.
