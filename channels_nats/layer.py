@@ -198,9 +198,12 @@ class NatsChannelLayer(BaseChannelLayer):
         given = options.pop("closed_cb", None)
 
         async def on_closed() -> None:
+            # Before the user's callback, not after: one that raises, hangs or gets
+            # cancelled would otherwise take the layer's own safety net with it, and
+            # a receive-only process has nothing else that would notice.
+            self._start_recovery(state)
             if given is not None:
                 await given()
-            self._start_recovery(state)
 
         return await nats.connect(servers=self.servers, closed_cb=on_closed, **options)
 

@@ -414,6 +414,37 @@ async def test_a_receive_only_process_comes_back_after_the_connection_closes(mak
                 pytest.fail("the receive-only worker never came back")
 
 
+async def test_a_failing_closed_cb_does_not_take_the_recovery_with_it(make_layer):
+    """The layer's safety net is what a receive-only process depends on."""
+    failures = []
+
+    async def closed_cb() -> None:
+        failures.append(1)
+        if len(failures) == 1:  # only the unexpected close; teardown closes on purpose
+            raise RuntimeError("the application's own callback failed")
+
+    worker = make_layer(connect_options={"closed_cb": closed_cb})
+    channel = await worker.new_channel()
+    publisher = make_layer()
+
+    try:
+        await worker._state().client.close()
+    except RuntimeError:
+        pass  # the user's callback is allowed to fail; the layer is not
+
+    receiving = asyncio.create_task(worker.receive(channel))
+    deadline = time.monotonic() + 20
+    while True:
+        await publisher.send(channel, {"type": "after"})
+        try:
+            assert await asyncio.wait_for(asyncio.shield(receiving), 0.5) == {"type": "after"}
+            return
+        except asyncio.TimeoutError:
+            if time.monotonic() > deadline:
+                receiving.cancel()
+                pytest.fail("a failing closed_cb stopped the layer from recovering")
+
+
 async def test_a_group_message_to_a_shared_channel_reaches_one_reader(make_layer):
     """A channel is a queue on the group path too, not only on the direct one."""
     workers = [make_layer(), make_layer()]
