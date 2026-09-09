@@ -70,10 +70,14 @@ class _LoopState:
 
     client: Client | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: Held while a subscription is being created, so that coroutines racing to
+    #: reach the same subject end up sharing one. Never taken inside ``lock``.
+    subscribe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     mailboxes: dict[str, _Mailbox] = field(default_factory=dict)
     groups: dict[str, set[str]] = field(default_factory=dict)
     group_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
+    recovery: asyncio.Task | None = None
 
 
 class NatsChannelLayer(BaseChannelLayer):
@@ -112,6 +116,10 @@ class NatsChannelLayer(BaseChannelLayer):
         connect_options: dict[str, t.Any] | None = None,
     ) -> None:
         super().__init__(expiry=expiry, capacity=capacity, channel_capacity=channel_capacity)
+        # BaseChannelLayer stores the raw dict, but get_capacity iterates compiled
+        # (pattern, capacity) pairs, so every layer has to compile it itself.
+        # Channels annotates the attribute as the dict its own get_capacity cannot read.
+        self.channel_capacity = self.compile_capacities(channel_capacity or {})  # type: ignore
         self.servers = [servers] if isinstance(servers, str) else list(servers)
         self.prefix = prefix
         self.group_expiry = group_expiry
@@ -153,10 +161,45 @@ class NatsChannelLayer(BaseChannelLayer):
             async with state.lock:
                 if state.client is None or state.client.is_closed:
                     stale = state.client is not None
-                    state.client = await nats.connect(servers=self.servers, **self.connect_options)
+                    state.client = await self._connect(state)
                     if stale:
                         await self._resubscribe(state, state.client)
         return state.client
+
+    async def _connect(self, state: _LoopState) -> Client:
+        options = dict(self.connect_options)
+        given = options.pop("closed_cb", None)
+
+        async def on_closed() -> None:
+            if given is not None:
+                await given()
+            self._start_recovery(state)
+
+        return await nats.connect(servers=self.servers, closed_cb=on_closed, **options)
+
+    def _start_recovery(self, state: _LoopState) -> None:
+        """Come back on our own once nats-py has given up reconnecting.
+
+        A process that only receives never calls ``_client()`` again, so nothing
+        would notice: its subscriptions would sit on a dead connection and
+        ``receive()`` would wait forever while other processes keep publishing.
+        """
+        if state not in self._states.values():
+            return  # closed on purpose; nothing to come back to
+        if state.recovery is not None and not state.recovery.done():
+            return
+        state.recovery = asyncio.create_task(self._recover(state))
+
+    async def _recover(self, state: _LoopState) -> None:
+        delay = 0.5
+        while state in self._states.values() and (state.client is None or state.client.is_closed):
+            try:
+                await self._client()  # reconnects and restores this loop's subscriptions
+                return
+            except Exception as error:
+                log.warning("channels_nats: reconnect failed (%s); trying again in %.1fs", error, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
 
     async def _resubscribe(self, state: _LoopState, client: Client) -> None:
         """Rebuild every subscription of this loop on a fresh connection.
@@ -237,10 +280,15 @@ class NatsChannelLayer(BaseChannelLayer):
     def _group_deliver(self, state: _LoopState, group: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
         async def deliver(msg: t.Any) -> None:
             message = self.serializer.loads(msg.data)
+            first = True
             for member in list(state.groups.get(group, ())):
                 box = state.mailboxes.get(member)
-                if box is not None:
-                    self._enqueue(box, member, message)
+                if box is None:
+                    continue
+                # Every member gets its own object. Handing one dict to several
+                # consumers lets one of them edit what the others receive.
+                self._enqueue(box, member, message if first else self.serializer.loads(msg.data))
+                first = False
 
         return deliver
 
@@ -294,7 +342,15 @@ class NatsChannelLayer(BaseChannelLayer):
             )
         state = self._state()
         box = state.mailboxes.get(channel)
-        if box is None:
+        if box is not None:
+            return box
+        # Subscribing takes a round trip, and connecting takes several. Without this
+        # lock, consumers arriving together each get past the check above and each
+        # subscribe, so one message arrives once per racing caller.
+        async with state.subscribe_lock:
+            box = state.mailboxes.get(channel)
+            if box is not None:  # somebody won the race while we waited
+                return box
             box = _Mailbox(queue=asyncio.Queue())
             state.mailboxes[channel] = box
             try:
@@ -311,11 +367,16 @@ class NatsChannelLayer(BaseChannelLayer):
             except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
                 if state.mailboxes.get(channel) is box:
                     del state.mailboxes[channel]
+                if box.subscription is not None:
+                    await self._unsubscribe([box.subscription])
                 raise
-        return box
+            return box
 
     async def _process_subscription(self, channel: str) -> None:
-        """One subscription per process prefix, routing by the ``Channel`` header."""
+        """One subscription per process prefix, routing by the ``Channel`` header.
+
+        Only called with ``subscribe_lock`` held, which is what keeps it to one.
+        """
         state = self._state()
         subject = self.process_subject(channel)
         if subject in state.process_subscriptions:
@@ -439,5 +500,7 @@ class NatsChannelLayer(BaseChannelLayer):
         """Close the connection owned by the current event loop."""
         state = self._states.pop(asyncio.get_running_loop(), None)
         self._forget_closed_loops()  # shutting one loop down is a fine time to drop the dead ones
+        if state is not None and state.recovery is not None:
+            state.recovery.cancel()
         if state is not None and state.client is not None and not state.client.is_closed:
             await state.client.drain()

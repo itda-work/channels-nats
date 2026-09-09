@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 import pytest
 from asgiref.sync import async_to_sync
@@ -40,6 +41,22 @@ async def test_group_send_reaches_every_member_in_every_process(make_layer):
 
     for worker, channel in ((worker_a, a1), (worker_a, a2), (worker_b, b1)):
         assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "chat", "n": 1}
+
+
+async def test_group_members_do_not_share_one_message_object(make_layer):
+    """One consumer editing what it received must not change what another one gets."""
+    worker = make_layer()
+    first, second = await worker.new_channel(), await worker.new_channel()
+    await worker.group_add("room", first)
+    await worker.group_add("room", second)
+
+    await worker.group_send("room", {"type": "chat", "items": [1]})
+
+    one = await asyncio.wait_for(worker.receive(first), 5)
+    two = await asyncio.wait_for(worker.receive(second), 5)
+    assert one is not two
+    one["items"].append(2)
+    assert two["items"] == [1]
 
 
 async def test_group_discard_stops_delivery(layer):
@@ -134,6 +151,28 @@ async def test_two_readers_in_one_process_share_the_channel(make_layer):
     assert len([task for task in (first, second) if task.done()]) == 1
     first.cancel()
     second.cancel()
+
+
+async def test_consumers_arriving_together_share_one_subscription(make_layer):
+    """Connections do not arrive one at a time; racing callers must not each subscribe."""
+    worker = make_layer()
+    channels = await asyncio.gather(*(worker.new_channel() for _ in range(8)))
+    state = worker._state()
+
+    assert len(state.process_subscriptions) == 1
+    assert len(state.client._subs) == 1  # what the server actually has, not just what we track
+
+    await worker.send(channels[0], {"type": "once"})
+    await asyncio.sleep(0.3)
+    assert state.mailboxes[channels[0]].queue.qsize() == 1
+
+
+def test_channel_capacity_patterns_are_compiled():
+    """get_capacity iterates compiled (pattern, capacity) pairs, not the dict as given."""
+    layer = NatsChannelLayer(channel_capacity={"specific.*": 2})
+
+    assert layer.get_capacity("specific.abc!def") == 2
+    assert layer.get_capacity("other-channel") == layer.capacity
 
 
 async def test_flush_clears_local_state(layer):
@@ -287,6 +326,27 @@ def test_loops_abandoned_without_close_are_reported_once(caplog):
     assert len(layer._states) == 6
     for loop in loops:
         loop.close()
+
+
+async def test_a_receive_only_process_comes_back_after_the_connection_closes(make_layer):
+    """Nothing calls _client() on the receive path, so the layer has to notice by itself."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    publisher = make_layer()
+
+    await worker._state().client.close()
+
+    receiving = asyncio.create_task(worker.receive(channel))
+    deadline = time.monotonic() + 20
+    while True:  # nothing is stored, so keep publishing until the worker is back
+        await publisher.send(channel, {"type": "after"})
+        try:
+            assert await asyncio.wait_for(asyncio.shield(receiving), 0.5) == {"type": "after"}
+            return
+        except asyncio.TimeoutError:
+            if time.monotonic() > deadline:
+                receiving.cancel()
+                pytest.fail("the receive-only worker never came back")
 
 
 async def test_invalid_names_are_rejected(layer):
