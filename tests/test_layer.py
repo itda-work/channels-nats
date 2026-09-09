@@ -1027,3 +1027,44 @@ async def test_a_cancellation_the_client_swallows_still_reaches_the_caller(layer
             await sending
     finally:
         client.publish = original
+
+
+async def test_a_cancelled_subscribe_does_not_wait_out_a_jammed_connection(layer):
+    """The cleanup for a cancelled subscribe must not block on the connection.
+
+    ``_subscribe()`` runs ``Client.subscribe()`` as a task so that a cancellation
+    cannot lose the handle (#11), and waits for it on the way out so the leftover
+    can be taken down. Under send backpressure that wait has no end: the cancelled
+    caller stays alive until the connection drains, which is the shutdown hang of
+    #23 by another road (reproduced against a real server with a stopped server).
+
+    The subscribe here is parked by hand rather than by backpressure -- deterministic,
+    and it runs on Windows, where there is no SIGSTOP.
+    """
+    client = await layer._client()
+    original, started, release, created = client.subscribe, asyncio.Event(), asyncio.Event(), []
+
+    async def parked_subscribe(*args, **kwargs):
+        started.set()
+        await release.wait()
+        created.append(await original(*args, **kwargs))
+        return created[-1]
+
+    client.subscribe = parked_subscribe
+    try:
+        opening = asyncio.create_task(layer._mailbox("jammed-channel"))
+        await asyncio.wait_for(started.wait(), 5)
+        opening.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(opening, 5)  # not "once the connection frees up"
+    finally:
+        release.set()
+        client.subscribe = original
+
+    # The handle still has to be taken down; that is what the waiting was for.
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if created and created[0]._closed:
+            break
+    assert created and created[0]._closed, "the leftover subscription was never unsubscribed"

@@ -78,6 +78,13 @@ log = logging.getLogger("channels_nats")
 
 Message = dict[str, t.Any]
 
+#: How long a cancelled subscribe waits for its own in-flight ``Client.subscribe()``
+#: before handing it to a background task. The wait exists so the leftover can be
+#: unsubscribed (see ``_subscribe``); it is bounded because under send backpressure
+#: that call does not return until the connection drains, and a cancellation that
+#: waits that long stops being a cancellation.
+SUBSCRIBE_CLEANUP_GRACE = 1.0
+
 
 class ChannelLayerClosed(RuntimeError):
     """Ends a ``receive()`` that was waiting when ``close()`` took the layer down.
@@ -135,6 +142,9 @@ class _LoopState:
     group_channel_subscriptions: dict[tuple[str, str], Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
+    #: Subscribes that outlived the caller that was cancelled, kept so that close()
+    #: can take them down rather than leaving a task pending at loop shutdown.
+    cleanups: set[asyncio.Task] = field(default_factory=set)
     swept_at: float = 0.0
     #: Messages nats-py threw away before they reached a mailbox, so they are in
     #: no mailbox's ``dropped``. Per connection, which is what the limit is on.
@@ -473,20 +483,49 @@ class NatsChannelLayer(BaseChannelLayer):
         every message a second time.
 
         Running it as a task keeps the handle reachable either way, so the caller
-        can unsubscribe on the way out. A second cancellation arriving while we
-        wait for it does leak -- there is nowhere left to wait.
+        can unsubscribe on the way out. That wait is bounded: under send backpressure
+        ``Client.subscribe()`` does not return until the connection drains, and a
+        cancelled caller that waits for that is no longer cancelled in any useful
+        sense. Past ``SUBSCRIBE_CLEANUP_GRACE`` the subscribe is handed to a
+        background task that takes it down whenever it does come up. A second
+        cancellation arriving while we wait does leak -- there is nowhere left to wait.
         """
         subscribing = asyncio.ensure_future(client.subscribe(subject, queue=queue, cb=cb))
         try:
             return await asyncio.shield(subscribing)
         except BaseException:
             try:
-                leftover = await subscribing
+                # shield again: a timeout here must not cancel the subscribe itself,
+                # or the handle goes back to being unreachable, which is #11.
+                leftover = await asyncio.wait_for(asyncio.shield(subscribing), SUBSCRIBE_CLEANUP_GRACE)
+            except asyncio.TimeoutError:
+                self._unsubscribe_later(subscribing)
             except Exception:
                 pass  # it never came up, so there is nothing to take down
             else:
                 await self._unsubscribe([leftover])
             raise
+
+    def _unsubscribe_later(self, subscribing: asyncio.Future) -> None:
+        """Take a subscription down once it finally comes up.
+
+        Its caller is gone, so nobody is left to hold the handle. The task is kept
+        on the loop's state: dropping the reference would let the garbage collector
+        take it, and a task still pending when the loop closes is reported as
+        destroyed. ``close()`` cancels whatever is still here.
+        """
+        state = self._state()
+
+        async def take_down() -> None:
+            try:
+                leftover = await subscribing
+            except Exception:
+                return  # it never came up
+            await self._unsubscribe([leftover])
+
+        task = asyncio.ensure_future(take_down())
+        state.cleanups.add(task)
+        task.add_done_callback(state.cleanups.discard)
 
     async def _flush_or_undo(self, client: Client, subscription: Subscription) -> None:
         """Wait for the server to have the subscription, or take it back down.
@@ -952,6 +991,9 @@ class NatsChannelLayer(BaseChannelLayer):
             for box in state.mailboxes.values():
                 box.closed = True  # before the drain, so a slow one cannot hold them there
                 self._wake_receivers(box)
+        if state is not None:
+            for cleanup in list(state.cleanups):
+                cleanup.cancel()  # the connection is going; the subscriptions go with it
         if state is not None and state.recovery is not None:
             state.recovery.cancel()
         if state is not None and state.client is not None and not state.client.is_closed:
