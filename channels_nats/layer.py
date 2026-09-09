@@ -239,25 +239,47 @@ class NatsChannelLayer(BaseChannelLayer):
         connection opened after that is new and knows nothing about them, so
         without this the process would keep publishing while receiving nothing.
         """
+        # Each subscribe is an await, and flush(), group_discard() or a cancelled
+        # receive() can run in it. So iterate over snapshots, and before storing a
+        # subscription check that what it belongs to is still wanted -- writing it
+        # back unconditionally would put a subscription the process has just given
+        # up back on the server, and it would keep delivering.
+        stale: list[Subscription] = []
         for subject in list(state.process_subscriptions):
-            state.process_subscriptions[subject] = await client.subscribe(subject, cb=self._process_deliver(state))
-        for channel, box in state.mailboxes.items():
-            if box.subscription is not None:
-                box.subscription = await client.subscribe(
-                    self.channel_subject(channel),
-                    queue=self.channel_queue_group(channel),
-                    cb=self._channel_deliver(box, channel),
-                )
-        for group in list(state.group_subscriptions):
-            state.group_subscriptions[group] = await client.subscribe(
-                self.group_subject(group), cb=self._group_deliver(state, group)
+            subscription = await client.subscribe(subject, cb=self._process_deliver(state))
+            if subject in state.process_subscriptions:
+                state.process_subscriptions[subject] = subscription
+            else:
+                stale.append(subscription)
+        for channel, box in list(state.mailboxes.items()):
+            if box.subscription is None:
+                continue
+            subscription = await client.subscribe(
+                self.channel_subject(channel),
+                queue=self.channel_queue_group(channel),
+                cb=self._channel_deliver(box, channel),
             )
+            if state.mailboxes.get(channel) is box:
+                box.subscription = subscription
+            else:
+                stale.append(subscription)
+        for group in list(state.group_subscriptions):
+            subscription = await client.subscribe(self.group_subject(group), cb=self._group_deliver(state, group))
+            if group in state.group_subscriptions:
+                state.group_subscriptions[group] = subscription
+            else:
+                stale.append(subscription)
         for group, channel in list(state.group_channel_subscriptions):
-            state.group_channel_subscriptions[group, channel] = await client.subscribe(
+            subscription = await client.subscribe(
                 self.group_subject(group),
                 queue=self.channel_queue_group(channel),
                 cb=self._group_channel_deliver(state, channel),
             )
+            if (group, channel) in state.group_channel_subscriptions:
+                state.group_channel_subscriptions[group, channel] = subscription
+            else:
+                stale.append(subscription)
+        await self._unsubscribe(stale)
         await client.flush()
         log.warning(
             "channels_nats: the NATS connection was closed; reconnected and restored %d subscriptions",

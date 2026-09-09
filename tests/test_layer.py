@@ -393,6 +393,39 @@ def test_loops_abandoned_without_close_are_reported_once(caplog):
         loop.close()
 
 
+async def test_recovery_does_not_bring_back_a_group_discarded_while_it_ran(make_layer):
+    """Rebuilding subscriptions takes many round trips, and the process keeps running."""
+    worker = make_layer()
+    channel = await worker.new_channel()
+    await worker.group_add("room", channel)
+    state = worker._state()
+    client = state.client
+    assert client is not None
+
+    entered, gate = asyncio.Event(), asyncio.Event()
+    real_subscribe = client.subscribe
+
+    async def slow_subscribe(subject, **kwargs):
+        subscription = await real_subscribe(subject, **kwargs)
+        if subject == worker.group_subject("room"):
+            entered.set()  # hold the recovery with the group already snapshotted
+            await gate.wait()
+        return subscription
+
+    client.subscribe = slow_subscribe
+    recovering = asyncio.create_task(worker._resubscribe(state, client))
+    await asyncio.wait_for(entered.wait(), 5)
+
+    await worker.group_discard("room", channel)
+    gate.set()
+    await asyncio.wait_for(recovering, 5)
+
+    assert "room" not in state.group_subscriptions
+    await worker.group_send("room", {"type": "gone"})
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(worker.receive(channel), 1)
+
+
 async def test_a_receive_only_process_comes_back_after_the_connection_closes(make_layer):
     """Nothing calls _client() on the receive path, so the layer has to notice by itself."""
     worker = make_layer()
@@ -416,6 +449,7 @@ async def test_a_receive_only_process_comes_back_after_the_connection_closes(mak
 
 async def test_a_failing_closed_cb_does_not_take_the_recovery_with_it(make_layer):
     """The layer's safety net is what a receive-only process depends on."""
+
     failures = []
 
     async def closed_cb() -> None:
