@@ -38,6 +38,9 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   rather than held, and polling one loses what arrives between two polls.
 - ``group_expiry`` is stored and never enforced: a membership goes on
   ``group_discard``, on ``flush()``, or when the process ends.
+- ``send``/``group_send`` can raise ``asyncio.CancelledError`` even though the
+  publish went out: nats-py discards a cancellation delivered while it waits to
+  flush, and the layer restores it rather than let a cancelled consumer run on.
 - ``close()`` ends a ``receive()`` that was waiting on this loop with
   ``ChannelLayerClosed``. Its mailbox goes with the loop's state and nothing would
   feed it again, and ``flush()``'s remedy -- move to the mailbox that replaces it --
@@ -540,7 +543,19 @@ class NatsChannelLayer(BaseChannelLayer):
                 f"message is {size} bytes on the wire, over the server's max_payload of "
                 f"{client.max_payload}; raise max_payload on nats-server or send less"
             )
+        task = asyncio.current_task()
+        requested = task.cancelling() if task is not None else 0
         await client.publish(subject, payload, headers=headers)
+        if task is not None and task.cancelling() > requested:
+            # nats-py's _flush_pending() ends with `except asyncio.CancelledError:
+            # pass`, so a cancellation delivered while a publish waits for the flusher
+            # is discarded and publish() returns as if nothing happened -- a consumer
+            # cancelled at shutdown goes back to its loop and never ends (#23; the
+            # real fix is upstream's to make). It does not uncancel(), so the request is
+            # counted here, which is the only trace it leaves. The publish itself may
+            # well have gone out; what is restored is the caller's cancellation, not
+            # the message.
+            raise asyncio.CancelledError
 
     def _drop_expired(self, box: _Mailbox, now: float) -> None:
         """Reclaim the room taken by messages ``receive()`` would throw away anyway.

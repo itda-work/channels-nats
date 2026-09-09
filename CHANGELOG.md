@@ -6,7 +6,12 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Changed
 
+- **`send()`·`group_send()`가 `asyncio.CancelledError`를 던질 수 있다.** nats-py가 삼킨 취소를 레이어가 되살리기 때문이다(아래 Fixed). 종료 경로에서만 보이는 변화이고, 취소를 요청한 쪽이 그것을 돌려받는 것이라 의미상 옳다
 - **지원하는 Python 하한을 3.13으로 올린다** (3.10·3.11·3.12 지원 중단). `Task.cancelling()`이 3.11부터라 그 아래에서는 nats-py가 삼킨 취소를 레이어가 알아볼 방법이 없고, 버전마다 갈라지는 코드를 두느니 하한을 올리는 쪽을 택했다. Django 4.2 LTS는 2026년 4월에 EOL이고 현행 LTS인 5.2가 3.13을 지원하므로 지원되는 Django 조합은 끊기지 않는다. 3.12 이하가 필요하면 0.6.1에 고정한다. CI 매트릭스도 ubuntu(3.13·3.14) + windows-latest(3.13)로 줄었다 — 이제 **Windows가 하한 버전을 돈다**
+
+### Fixed
+
+- **nats-py가 삼킨 취소가 컨슈머를 계속 돌게 두었다.** `Client._flush_pending()`이 `except asyncio.CancelledError: pass`로 끝나, 송신 backpressure로 flush를 기다리는 동안 도착한 취소가 버려지고 `publish()`가 아무 일 없었다는 듯 반환한다(nats-py 2.15.0 기본 설정, 실제 서버로 재현). 그러면 종료 중 취소된 컨슈머가 자기 루프로 돌아가 끝나지 않고, **한 번만 취소하고 `gather`로 기다리는** daphne의 종료 경로가 멈춘다(daphne의 두 단계를 실제 Channels 컨슈머 위에서 재현). 이제 `_publish()`가 호출 전후의 `Task.cancelling()`을 비교해 그 취소를 되살린다 — nats-py는 `uncancel()`을 부르지 않으므로 요청이 세어진 채 남는 것이 유일한 흔적이다. 되살리는 것은 호출자의 취소이지 메시지가 아니며, **진짜 고칠 자리는 nats-py다** (#23)
 
 ## [0.6.1] - 2026-09-09
 

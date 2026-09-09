@@ -993,3 +993,37 @@ async def test_a_cancelled_read_does_not_revive_a_closed_loop(layer):
         await waiting
 
     assert layer._states == {}
+
+
+async def test_a_cancellation_the_client_swallows_still_reaches_the_caller(layer):
+    """nats-py discards a cancellation delivered while it waits to flush.
+
+    ``Client._flush_pending()`` ends with ``except asyncio.CancelledError: pass``,
+    so a cancel that lands while a publish waits for the flusher is thrown away and
+    ``publish()`` returns as if nothing happened -- a consumer cancelled at shutdown
+    goes back to its loop and never ends (reproduced against a real server, #23).
+    It never calls ``uncancel()``, which is what leaves the request countable.
+
+    This test does not prove nats-py swallows anything; it stands in for that with a
+    publish that swallows the same way, and pins what the layer does about it.
+    """
+    client = await layer._client()
+    original, parked = client.publish, asyncio.Event()
+
+    async def swallowing_publish(*args, **kwargs):
+        parked.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # exactly what _flush_pending does, uncancel() included: it does not
+
+    client.publish = swallowing_publish
+    try:
+        sending = asyncio.create_task(layer.group_send("room", {"type": "test.message"}))
+        await asyncio.wait_for(parked.wait(), 5)
+        assert sending.cancel(), "the send should still have been running"
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+    finally:
+        client.publish = original
