@@ -19,10 +19,12 @@ from channels_nats import NatsChannelLayer
 
 
 def find_nats_server() -> str | None:
+    go_bin = Path.home() / "go" / "bin"
     candidates = [
         os.environ.get("NATS_SERVER"),
-        shutil.which("nats-server"),
-        str(Path.home() / "go" / "bin" / "nats-server"),
+        shutil.which("nats-server"),  # finds nats-server.exe on Windows through PATHEXT
+        str(go_bin / "nats-server"),
+        str(go_bin / "nats-server.exe"),  # what `go install` writes on Windows
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
