@@ -414,12 +414,17 @@ async def test_flush_survives_a_connection_that_is_already_gone(make_layer):
     await worker._state().client.close()
     await worker.flush()
 
-    state = worker._state()
-    assert not state.mailboxes and not state.groups and not state.group_subscriptions
-    assert not state.process_subscriptions
+    # The reader flush woke re-establishes its own channel rather than waiting on a
+    # dead queue (#21), and now does so while flush is still tidying up, so let it
+    # finish before reading the state: what is asserted is what flush is responsible
+    # for, not a race with a reader doing what it is supposed to.
     receiving.cancel()
     with pytest.raises(asyncio.CancelledError):
         await receiving
+
+    state = worker._state()
+    assert not state.mailboxes and not state.groups and not state.group_subscriptions
+    assert not state.process_subscriptions
 
 
 def test_close_also_forgets_other_closed_loops():
@@ -1068,3 +1073,32 @@ async def test_a_cancelled_subscribe_does_not_wait_out_a_jammed_connection(layer
         if created and created[0]._closed:
             break
     assert created and created[0]._closed, "the leftover subscription was never unsubscribed"
+
+
+async def test_a_cancelled_read_does_not_wait_out_a_jammed_unsubscribe(layer):
+    """Taking a subscription down blocks on a jammed connection too.
+
+    ``Subscription.unsubscribe()`` sends a command, so under send backpressure it
+    waits in the same place ``Client.subscribe()`` does -- measured against a real
+    server, still parked after eight seconds while the connection stayed saturated.
+    Every cleanup that unsubscribes after a cancellation inherits that wait, which
+    is what #26 fixed one level up.
+    """
+    box = await layer._mailbox("plain-with-a-jammed-unsubscribe")
+    release = asyncio.Event()
+    original = box.subscription.unsubscribe
+
+    async def parked_unsubscribe(*args, **kwargs):
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    box.subscription.unsubscribe = parked_unsubscribe
+    try:
+        reading = asyncio.create_task(layer.receive("plain-with-a-jammed-unsubscribe"))
+        await asyncio.sleep(0.1)
+        reading.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(reading, 5)  # not "once the connection frees up"
+    finally:
+        release.set()

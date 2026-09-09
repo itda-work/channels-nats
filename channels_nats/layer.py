@@ -78,12 +78,13 @@ log = logging.getLogger("channels_nats")
 
 Message = dict[str, t.Any]
 
-#: How long a cancelled subscribe waits for its own in-flight ``Client.subscribe()``
-#: before handing it to a background task. The wait exists so the leftover can be
-#: unsubscribed (see ``_subscribe``); it is bounded because under send backpressure
-#: that call does not return until the connection drains, and a cancellation that
-#: waits that long stops being a cancellation.
-SUBSCRIBE_CLEANUP_GRACE = 1.0
+#: How long tidying up waits for a command the connection has not sent yet, before
+#: handing it to a background task. Both ``Client.subscribe()`` and
+#: ``Subscription.unsubscribe()`` wait for the wire, so under send backpressure
+#: neither returns until the connection drains -- and a cancellation that waits
+#: that long has stopped being a cancellation. The work still happens; what is
+#: bounded is how long the caller is held for it.
+CLEANUP_GRACE = 1.0
 
 
 class ChannelLayerClosed(RuntimeError):
@@ -142,9 +143,9 @@ class _LoopState:
     group_channel_subscriptions: dict[tuple[str, str], Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
-    #: Subscribes that outlived the caller that was cancelled, kept so that close()
-    #: can take them down rather than leaving a task pending at loop shutdown.
-    cleanups: set[asyncio.Task] = field(default_factory=set)
+    #: Commands that outlived the caller that was cancelled, kept so that close()
+    #: can take them down rather than leaving one pending at loop shutdown.
+    cleanups: set[asyncio.Future] = field(default_factory=set)
     swept_at: float = 0.0
     #: Messages nats-py threw away before they reached a mailbox, so they are in
     #: no mailbox's ``dropped``. Per connection, which is what the limit is on.
@@ -486,7 +487,7 @@ class NatsChannelLayer(BaseChannelLayer):
         can unsubscribe on the way out. That wait is bounded: under send backpressure
         ``Client.subscribe()`` does not return until the connection drains, and a
         cancelled caller that waits for that is no longer cancelled in any useful
-        sense. Past ``SUBSCRIBE_CLEANUP_GRACE`` the subscribe is handed to a
+        sense. Past ``CLEANUP_GRACE`` the subscribe is handed to a
         background task that takes it down whenever it does come up. A second
         cancellation arriving while we wait does leak -- there is nowhere left to wait.
         """
@@ -497,7 +498,7 @@ class NatsChannelLayer(BaseChannelLayer):
             try:
                 # shield again: a timeout here must not cancel the subscribe itself,
                 # or the handle goes back to being unreachable, which is #11.
-                leftover = await asyncio.wait_for(asyncio.shield(subscribing), SUBSCRIBE_CLEANUP_GRACE)
+                leftover = await asyncio.wait_for(asyncio.shield(subscribing), CLEANUP_GRACE)
             except asyncio.TimeoutError:
                 self._unsubscribe_later(subscribing)
             except Exception:
@@ -509,12 +510,8 @@ class NatsChannelLayer(BaseChannelLayer):
     def _unsubscribe_later(self, subscribing: asyncio.Future) -> None:
         """Take a subscription down once it finally comes up.
 
-        Its caller is gone, so nobody is left to hold the handle. The task is kept
-        on the loop's state: dropping the reference would let the garbage collector
-        take it, and a task still pending when the loop closes is reported as
-        destroyed. ``close()`` cancels whatever is still here.
+        Its caller is gone, so nobody is left to hold the handle.
         """
-        state = self._state()
 
         async def take_down() -> None:
             try:
@@ -523,7 +520,18 @@ class NatsChannelLayer(BaseChannelLayer):
                 return  # it never came up
             await self._unsubscribe([leftover])
 
-        task = asyncio.ensure_future(take_down())
+        self._finish_later(asyncio.ensure_future(take_down()))
+
+    def _finish_later(self, work: asyncio.Future) -> None:
+        """Let a command the caller no longer waits for run to its end.
+
+        The loop's state holds it: dropping the reference would let the garbage
+        collector take the task, and one still pending when the loop closes is
+        reported as destroyed. ``close()`` cancels whatever is still here -- the
+        connection goes with it, and so do its subscriptions.
+        """
+        task = asyncio.ensure_future(work)
+        state = self._state()
         state.cleanups.add(task)
         task.add_done_callback(state.cleanups.discard)
 
@@ -543,11 +551,20 @@ class NatsChannelLayer(BaseChannelLayer):
         """Drop subscriptions, tolerating a connection that has already gone.
 
         Every caller has finished its bookkeeping by now, so a connection that
-        died must not turn tearing down into an error.
+        died must not turn tearing down into an error. Nor must a jammed one hold
+        the caller: ``unsubscribe()`` sends a command, so under send backpressure it
+        waits for the connection to drain (measured: still waiting after eight
+        seconds). Callers tidying up after a cancellation would wait with it, so
+        past ``CLEANUP_GRACE`` the command is left to a background task.
         """
         for subscription in subscriptions:
+            dropping = asyncio.ensure_future(subscription.unsubscribe())
             try:
-                await subscription.unsubscribe()
+                # shield: the timeout must not cancel the unsubscribe itself, or the
+                # subscription stays up and keeps taking messages from its queue group.
+                await asyncio.wait_for(asyncio.shield(dropping), CLEANUP_GRACE)
+            except asyncio.TimeoutError:
+                self._finish_later(dropping)
             except Exception as error:
                 log.debug("channels_nats: could not unsubscribe: %s", error)
 
