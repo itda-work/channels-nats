@@ -59,7 +59,7 @@ Message = dict[str, t.Any]
 
 @dataclass
 class _Mailbox:
-    queue: asyncio.Queue[tuple[float, Message]]
+    queue: asyncio.Queue[tuple[float, bytes]]
     subscription: Subscription | None = None
     receivers: int = 0
     dropped: int = 0
@@ -283,7 +283,7 @@ class NatsChannelLayer(BaseChannelLayer):
 
     def _channel_deliver(self, box: _Mailbox, channel: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
         async def deliver(msg: t.Any) -> None:
-            self._enqueue(box, channel, serializers.loads(msg.data))
+            self._enqueue(box, channel, msg.data)
 
         return deliver
 
@@ -294,24 +294,18 @@ class NatsChannelLayer(BaseChannelLayer):
                 return
             box = state.mailboxes.get(target)
             if box is not None:
-                self._enqueue(box, target, serializers.loads(msg.data))
+                self._enqueue(box, target, msg.data)
 
         return deliver
 
     def _group_deliver(self, state: _LoopState, group: str) -> t.Callable[[t.Any], t.Awaitable[None]]:
         async def deliver(msg: t.Any) -> None:
-            message = serializers.loads(msg.data)
-            first = True
             for member in list(state.groups.get(group, ())):
                 if "!" not in member:
                     continue  # plain channels come in on their own queue subscription
                 box = state.mailboxes.get(member)
-                if box is None:
-                    continue
-                # Every member gets its own object. Handing one dict to several
-                # consumers lets one of them edit what the others receive.
-                self._enqueue(box, member, message if first else serializers.loads(msg.data))
-                first = False
+                if box is not None:
+                    self._enqueue(box, member, msg.data)
 
         return deliver
 
@@ -331,7 +325,7 @@ class NatsChannelLayer(BaseChannelLayer):
         async def deliver(msg: t.Any) -> None:
             box = state.mailboxes.get(channel)
             if box is not None:
-                self._enqueue(box, channel, serializers.loads(msg.data))
+                self._enqueue(box, channel, msg.data)
 
         return deliver
 
@@ -373,7 +367,13 @@ class NatsChannelLayer(BaseChannelLayer):
         for entry in kept:
             box.queue.put_nowait(entry)
 
-    def _enqueue(self, box: _Mailbox, channel: str, message: Message) -> None:
+    def _enqueue(self, box: _Mailbox, channel: str, payload: bytes) -> None:
+        """Queue the encoded message.
+
+        Decoding waits for ``receive()``: it happens once per message actually
+        taken, each reader parses its own bytes into its own object, and messages
+        dropped for capacity or expiry are never decoded at all.
+        """
         now = time.monotonic()
         capacity = self.get_capacity(channel)
         if box.queue.qsize() >= capacity:
@@ -399,7 +399,7 @@ class NatsChannelLayer(BaseChannelLayer):
             )
             box.dropped = 0
             box.warned_at = None
-        box.queue.put_nowait((now, message))
+        box.queue.put_nowait((now, payload))
 
     async def _mailbox(self, channel: str) -> _Mailbox:
         """Local queue for ``channel``.
@@ -475,10 +475,10 @@ class NatsChannelLayer(BaseChannelLayer):
         cancelled = False
         try:
             while True:
-                queued_at, message = await box.queue.get()
+                queued_at, payload = await box.queue.get()
                 if time.monotonic() - queued_at > self.expiry:
                     continue
-                return message
+                return serializers.loads(payload)
         except asyncio.CancelledError:
             cancelled = True
             raise
