@@ -4,6 +4,11 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ## [Unreleased]
 
+### Changed
+
+- `extensions`에서 **`flush`를 뺀다** (`["groups"]`). 스펙의 `flush` 확장은 분산 레이어가 모든 클라이언트에 비어 보이기를 요구하는데, 이 `flush()`는 한 인스턴스의 현재 이벤트 루프만 지운다. 메서드는 그대로 두고 선언만 실제에 맞춘다 — Channels 자체는 `extensions`를 읽지 않으므로 프레임워크 동작에는 영향이 없다 (#7)
+- `group_expiry`를 **집행하지 않는다는 사실을 명시한다.** 값을 받아 두기만 하고 읽지 않는다는 것을 README와 모듈 docstring에 적었다. 동작은 그대로다 (#7)
+
 ### Fixed
 
 - 같은 레이어 인스턴스를 **두 이벤트 루프**에서 수신하면 프로세스 전용 채널이 중복 전달됐다. 채널 이름의 프로세스 id가 인스턴스당 하나여서 두 루프가 같은 `<prefix>.pc.<process>` subject에 각각 구독을 만들고, 각자 자기 mailbox에 넣었다 — `send()` 한 번이 두 번 도착한다(재현함). id를 이벤트 루프별로 두어 루프마다 subject가 갈리고, 다른 루프의 채널로 `receive`·`group_add`를 부르면 기존 "다른 프로세스의 채널" 경로와 같이 `ValueError`가 된다. subject 형식은 그대로다 (#3)

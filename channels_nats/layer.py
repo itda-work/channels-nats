@@ -31,6 +31,8 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   pending read to cancel at all. A plain channel is different -- its subscription
   is under the channel's queue group, so it is released on the cancelled read
   rather than held, and polling one loses what arrives between two polls.
+- ``group_expiry`` is stored and never enforced: a membership goes on
+  ``group_discard``, on ``flush()``, or when the process ends.
 - If nats-py gives up reconnecting and closes the client, the next call opens a
   new connection and restores this loop's subscriptions on it.
 
@@ -118,7 +120,11 @@ class NatsChannelLayer(BaseChannelLayer):
         }
     """
 
-    extensions = ["groups", "flush"]
+    #: ``flush`` is not here on purpose. The spec's flush extension has to leave the
+    #: layer looking empty to every client of a distributed layer; ``flush()`` below
+    #: clears one event loop of one instance, which is enough to reset a test and not
+    #: what the extension promises. The method stays; the claim does not.
+    extensions = ["groups"]
 
     #: The spec asks a layer to carry these. ``ChannelFull`` is never raised here:
     #: over pub/sub a sender cannot see the receiver's queue (see the README).
@@ -684,7 +690,14 @@ class NatsChannelLayer(BaseChannelLayer):
     # ------------------------------------------------------------------ lifecycle
 
     async def flush(self) -> None:
-        """Drop this process's subscriptions, mailboxes and group memberships."""
+        """Drop this instance's subscriptions, mailboxes and group memberships.
+
+        This event loop's, and only this instance's. The spec's ``flush`` extension
+        asks for a layer that looks empty to every client of a distributed layer,
+        which would need a control subject other processes listen on; ``extensions``
+        does not claim it. Enough to reset one process between tests, which is what
+        it is for.
+        """
         state = self._state()
         stale = [
             *state.group_subscriptions.values(),
