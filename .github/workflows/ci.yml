@@ -13,23 +13,42 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.13", "3.14"]
-    runs-on: ubuntu-latest
+        include:
+          # Windows is a supported platform, so it gets a runner. One version is
+          # enough here: what this job is for is the platform, not the version.
+          - os: windows-latest
+            python-version: "3.13"
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       # Pinned exactly: setup-uv dropped its floating major tags in v8.
       - uses: astral-sh/setup-uv@v10.0.1
       - run: uv python install ${{ matrix.python-version }}
 
-      - name: Install nats-server
+      - name: Install nats-server (Linux)
+        if: runner.os == 'Linux'
         run: |
           curl -sL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" | tar xz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nats-server-${NATS_VERSION}-linux-amd64" >> "$GITHUB_PATH"
 
+      - name: Install nats-server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "nats-server-$env:NATS_VERSION-windows-amd64"
+          Invoke-WebRequest -Uri "https://github.com/nats-io/nats-server/releases/download/$env:NATS_VERSION/$name.zip" -OutFile "$env:RUNNER_TEMP\nats.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\nats.zip" -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\$name" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - run: uv sync --all-extras
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      # Type checking is platform-independent; one job is enough to catch a regression.
-      - if: matrix.python-version == '3.13'
+      # Lint and types on Linux only. They are platform-independent, and a Windows
+      # checkout has CRLF line endings, which the format check would fail on.
+      - if: runner.os == 'Linux'
+        run: uv run ruff check .
+      - if: runner.os == 'Linux'
+        run: uv run ruff format --check .
+      - if: runner.os == 'Linux' && matrix.python-version == '3.13'
         run: uv run pyright
       - run: uv run pytest -v
