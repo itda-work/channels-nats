@@ -2,6 +2,14 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
+## [Unreleased]
+
+### Fixed
+
+- **`close()`가 대기 중인 `receive()`를 영원히 멈춰 두었다.** `close()`는 그 루프의 상태를 통째로 버리고 연결을 drain하므로 이미 `queue.get()`에 걸려 있던 `receive()`는 버려진 mailbox를 쥔 채 남았고, 누군가 취소하기 전까지 아무 일도 일어나지 않았다(실제 서버로 재현, 0.5.0에서도 재현됨). 이제 `close()`가 그 대기자들을 깨우고 `receive()`는 새 예외 **`ChannelLayerClosed`**(`RuntimeError` 하위, `channels_nats`에서 export)로 끝난다. `flush()`의 처방(새 mailbox로 옮기기)은 쓸 수 없었다 — 새 mailbox를 얻으려면 방금 닫은 연결을 다시 열게 된다 (#22)
+
+`receive()`의 계약이 바뀐다. 실제 Channels 컨슈머로 확인한 결과: 컨슈머 인스턴스가 이 예외로 끝나고, daphne의 정상 종료 경로(`kill_all_applications`)는 `addErrback`으로 삼켜 로그에 남기지 않는다. 서버가 살아 있는 동안 `close()`를 부르면 `application_checker`가 "Exception inside application"으로 남긴다.
+
 ## [0.5.0] - 2026-09-09
 
 ### Changed

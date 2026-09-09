@@ -6,7 +6,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from channels.exceptions import MessageTooLarge
 
-from channels_nats import NatsChannelLayer
+from channels_nats import ChannelLayerClosed, NatsChannelLayer
 
 pytestmark = pytest.mark.integration
 
@@ -943,3 +943,32 @@ async def test_expiry_counts_time_in_the_mailbox_not_the_age_of_the_message(make
     time.sleep(1.5)  # blocks the loop: the callback cannot file it while we wait
 
     assert await asyncio.wait_for(reader.receive(channel), 5) == {"type": "old"}
+
+
+async def test_close_ends_a_waiting_receiver(layer):
+    """``close()`` drops this loop's state, so nothing feeds the mailbox again.
+
+    A ``receive()`` already waiting on it would stay pending until somebody
+    cancels it (reproduced against a real server before the fix). ``flush()``'s
+    remedy -- move to the mailbox that replaces this one -- cannot be used here:
+    it would reopen the connection the caller has just closed.
+    """
+    channel = await layer.new_channel()
+    waiting = asyncio.create_task(layer.receive(channel))
+    await asyncio.sleep(0.1)  # let it subscribe and settle on the queue
+
+    await layer.close()
+
+    with pytest.raises(ChannelLayerClosed):
+        await asyncio.wait_for(waiting, 5)
+
+
+async def test_close_ends_every_reader_of_a_shared_channel(layer):
+    readers = [asyncio.create_task(layer.receive("shared")) for _ in range(2)]
+    await asyncio.sleep(0.1)
+
+    await layer.close()
+
+    for reader in readers:
+        with pytest.raises(ChannelLayerClosed):
+            await asyncio.wait_for(reader, 5)

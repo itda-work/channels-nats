@@ -38,6 +38,10 @@ Semantics follow the Channels layer spec on an at-most-once transport:
   rather than held, and polling one loses what arrives between two polls.
 - ``group_expiry`` is stored and never enforced: a membership goes on
   ``group_discard``, on ``flush()``, or when the process ends.
+- ``close()`` ends a ``receive()`` that was waiting on this loop with
+  ``ChannelLayerClosed``. Its mailbox goes with the loop's state and nothing would
+  feed it again, and ``flush()``'s remedy -- move to the mailbox that replaces it --
+  would reopen the connection the caller has just closed.
 - If nats-py gives up reconnecting and closes the client, the next call opens a
   new connection and restores this loop's subscriptions on it.
 
@@ -72,6 +76,17 @@ log = logging.getLogger("channels_nats")
 Message = dict[str, t.Any]
 
 
+class ChannelLayerClosed(RuntimeError):
+    """Ends a ``receive()`` that was waiting when ``close()`` took the layer down.
+
+    ``close()`` drops the event loop's state and drains its connection, so nothing
+    will feed that mailbox again. ``flush()``'s remedy -- wake the receiver and move
+    it to the mailbox that replaces this one -- cannot be used here: reaching for a
+    new mailbox would reopen the connection the caller has just closed. So the read
+    ends and says why, rather than waiting for a message that cannot arrive.
+    """
+
+
 @dataclass
 class _Mailbox:
     queue: asyncio.Queue[tuple[float, bytes]]
@@ -88,6 +103,9 @@ class _Mailbox:
     #: that, so a receiver waiting on it has to move to the mailbox that replaces
     #: it instead of waiting for a message that can never arrive.
     superseded: bool = False
+    #: Set when ``close()`` takes the whole loop's state away. Nothing replaces this
+    #: mailbox, so a receiver waiting on it ends with ``ChannelLayerClosed``.
+    closed: bool = False
     receivers: int = 0
     dropped: int = 0
     warned_at: float | None = None
@@ -647,6 +665,11 @@ class NatsChannelLayer(BaseChannelLayer):
         try:
             while True:
                 queued_at, payload = await box.queue.get()
+                if box.closed:
+                    # close() dropped the state this mailbox belonged to. Unlike a
+                    # superseded one it has no replacement to move to, and asking for
+                    # one would reopen the connection the caller has just closed.
+                    raise ChannelLayerClosed(f"receive({channel!r}) was waiting when the layer was closed")
                 if box.superseded:
                     # flush() dropped this mailbox, and what was left in its queue
                     # went with it. Take up the one that replaced it -- the two
@@ -738,15 +761,20 @@ class NatsChannelLayer(BaseChannelLayer):
                 continue
             del state.mailboxes[channel]
 
-    def _supersede(self, box: _Mailbox) -> None:
-        """Wake the receivers waiting on a mailbox that is being taken away.
+    def _wake_receivers(self, box: _Mailbox) -> None:
+        """Wake everyone waiting on a mailbox that is being taken away.
 
         One wake-up per receiver, since each is waiting on its own ``get()``. The
-        entry itself is never read as a message: ``receive()`` sees the flag first.
+        entry itself is never read as a message: ``receive()`` sees the flag that
+        the caller set before it looks at what came off the queue.
         """
-        box.superseded = True
         for _ in range(box.receivers):
             box.queue.put_nowait((time.monotonic(), b""))
+
+    def _supersede(self, box: _Mailbox) -> None:
+        """Take a mailbox away from its receivers, who move to its replacement."""
+        box.superseded = True
+        self._wake_receivers(box)
 
     async def _discard_mailbox(self, channel: str, box: _Mailbox) -> None:
         """Forget a plain channel whose last receiver was cancelled.
@@ -881,9 +909,20 @@ class NatsChannelLayer(BaseChannelLayer):
         await self._unsubscribe(stale)
 
     async def close(self) -> None:
-        """Close the connection owned by the current event loop."""
+        """Close the connection owned by the current event loop.
+
+        A ``receive()`` already waiting when this runs ends with
+        ``ChannelLayerClosed``: its mailbox goes with the state and would never be
+        fed again. Later calls are free to open a new connection -- this closes the
+        one that exists, it does not retire the layer -- but a process channel from
+        before belongs to the old client id and is no longer this loop's to receive.
+        """
         state = self._states.pop(asyncio.get_running_loop(), None)
         self._forget_closed_loops()  # shutting one loop down is a fine time to drop the dead ones
+        if state is not None:
+            for box in state.mailboxes.values():
+                box.closed = True  # before the drain, so a slow one cannot hold them there
+                self._wake_receivers(box)
         if state is not None and state.recovery is not None:
             state.recovery.cancel()
         if state is not None and state.client is not None and not state.client.is_closed:
