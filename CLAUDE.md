@@ -26,7 +26,7 @@ scripts/release_check.py  태그·CHANGELOG·분류자가 pyproject의 version�
 
 - 사용자 쪽 API를 늘리지 않는다. 옵션은 `CONFIG`로만.
 - subject 형식(`<prefix>.ch.<channel>`, `<prefix>.grp.<group>`)은 외부 계약이다. 바꾸면 README와 CHANGELOG에 남기고 메이저를 올린다.
-- Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. CI는 ubuntu와 windows 둘 다.
+- Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. 다만 CI는 ubuntu만 돈다. Windows는 코드 원칙으로 지키는 것이지 CI로 검증되지 않으므로, 타이밍이나 경로에 민감한 변경은 손으로 확인한다(0.2.1의 클러스터 레이스는 Windows에서만 났다).
 - 커밋 메시지는 영어 Conventional Commits. 문서는 한국어.
 - 릴리스는 `pyproject.toml`의 version을 올리고 CHANGELOG에 절을 추가한 뒤 `make release-check`로 확인하고 `v<version>` 태그를 푸시한다. 버전을 선언하는 곳은 `pyproject.toml` 하나다(`__version__`은 설치 메타데이터에서 읽는다). `release.yml`이 빌드해 PyPI(trusted publishing, environment `pypi`)와 GitHub Release에 올린다. 토큰은 저장하지 않는다.
 
