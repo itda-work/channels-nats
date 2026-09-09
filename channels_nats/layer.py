@@ -65,7 +65,6 @@ import typing as t
 import uuid
 from dataclasses import dataclass, field
 
-import nats
 from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
@@ -299,7 +298,36 @@ class NatsChannelLayer(BaseChannelLayer):
                 # the nats logger for other errors does not go quiet.
                 logging.getLogger("nats.aio.client").error("nats: encountered error", exc_info=error)
 
-        return await nats.connect(servers=self.servers, closed_cb=on_closed, error_cb=on_error, **options)
+        # Built here rather than through nats.connect(), which constructs the client
+        # inside and so hands a cancelled call nothing: the socket it had already
+        # opened then waited for the garbage collector, which Python reports as an
+        # unclosed transport (measured against a server that accepts and stays
+        # silent -- a wedged broker, or a load balancer with no backend).
+        client = Client()
+        try:
+            await client.connect(servers=self.servers, closed_cb=on_closed, error_cb=on_error, **options)
+        except BaseException:
+            # Closed in a task of its own: doing it here would run under this call's
+            # own cancellation, and nats-py's close takes that as a reason to return
+            # early -- measured, with the transport still up and the peer still
+            # holding the connection. A fresh task has no cancellation to trip over.
+            self._finish_later(self._close_quietly(client))
+            raise
+        return client
+
+    async def _close_quietly(self, client: Client) -> None:
+        """Close a connection nobody received, without making that anyone's problem."""
+        await asyncio.sleep(0)  # let a cancelled connect unwind before closing it
+        try:
+            await asyncio.wait_for(client.close(), CLEANUP_GRACE)
+        except (Exception, asyncio.TimeoutError) as error:
+            log.debug("channels_nats: could not close a connection that never came up: %s", error)
+        # This releases a connect that failed or timed out. A connect that was
+        # *cancelled* is not released by it -- close() returns with is_closed set and
+        # the peer still holding the socket, which then waits for the garbage
+        # collector (measured; closing the transport by hand does not help either).
+        # One socket per cancelled connect, where the retry loop's failures used to
+        # pile up one per attempt.
 
     def _note_slow_consumer(self, state: _LoopState, error: SlowConsumerError) -> None:
         """Report a message nats-py dropped before it could reach a mailbox.
@@ -522,7 +550,7 @@ class NatsChannelLayer(BaseChannelLayer):
 
         self._finish_later(asyncio.ensure_future(take_down()))
 
-    def _finish_later(self, work: asyncio.Future) -> None:
+    def _finish_later(self, work: asyncio.Future | t.Coroutine[t.Any, t.Any, t.Any]) -> None:
         """Let a command the caller no longer waits for run to its end.
 
         The loop's state holds it: dropping the reference would let the garbage

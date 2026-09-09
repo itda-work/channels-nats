@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -1207,3 +1208,47 @@ async def test_close_settles_the_recovery_it_cancels(layer):
     await layer.close()
 
     assert state.recovery.done(), "close() returned with recovery still mid-cancellation"
+
+
+async def test_connects_that_time_out_do_not_pile_up_sockets():
+    """A connect that fails has to release the socket it opened.
+
+    ``nats.connect()`` builds the client inside, so a failed call hands back nothing
+    and the socket waited for the garbage collector -- measured against a server that
+    accepts and stays silent: five timed-out connects, five sockets still held. The
+    recovery loop retries for as long as the layer is up, so those add up. The layer
+    builds the client itself now and closes it when the connect does not come up.
+
+    The server here is a plain asyncio one; no nats-server is involved.
+    """
+    peers: dict = {}
+
+    async def silent(reader, writer):
+        peer = writer.get_extra_info("peername")
+        peers[peer] = writer
+        await reader.read(1)  # never send INFO, so the handshake times out
+        peers.pop(peer, None)
+        writer.close()
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{port}",
+        connect_options={"connect_timeout": 1, "allow_reconnect": False, "max_reconnect_attempts": 0},
+    )
+    try:
+        for _ in range(3):
+            with pytest.raises(Exception):
+                await layer.new_channel()
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            if not peers:
+                break
+        assert not peers, f"{len(peers)} socket(s) left behind by connects that never came up"
+    finally:
+        await layer.close()
+        for writer in list(peers.values()):
+            writer.close()
+        server.close()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(server.wait_closed(), 5)
