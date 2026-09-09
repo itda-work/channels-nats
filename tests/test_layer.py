@@ -785,3 +785,36 @@ async def test_a_cancelled_flush_leaves_no_unconfirmed_subscription(layer):
     channel = await layer.new_channel()
     await layer.send(channel, {"type": "after"})
     assert await asyncio.wait_for(layer.receive(channel), 5) == {"type": "after"}
+
+
+async def test_flush_does_not_strand_a_waiting_receiver(layer):
+    """``flush()`` drops the mailboxes, including one a receiver is waiting on.
+
+    That queue is never fed again -- the subscription is gone and the next message
+    goes to the mailbox that replaces it -- so the receiver would wait for as long
+    as nobody cancels it. Reproduced against a real server before the fix: the
+    read stayed pending while the new mailbox held the message.
+    """
+    channel = await layer.new_channel()
+    waiting = asyncio.create_task(layer.receive(channel))
+    await asyncio.sleep(0.1)  # let it subscribe and settle on the queue
+
+    await layer.flush()
+    await layer._mailbox(channel)  # the channel is established again, however it happens
+    await layer.send(channel, {"type": "after"})
+
+    assert await asyncio.wait_for(waiting, 5) == {"type": "after"}
+    assert layer._state().mailboxes[channel].receivers == 0
+
+
+async def test_flush_wakes_every_reader_of_a_shared_channel(layer):
+    readers = [asyncio.create_task(layer.receive("shared")) for _ in range(2)]
+    await asyncio.sleep(0.1)
+
+    await layer.flush()
+    await layer._mailbox("shared")
+    for index in range(2):
+        await layer.send("shared", {"type": "chat", "index": index})
+
+    delivered = [(await asyncio.wait_for(reader, 5))["index"] for reader in readers]
+    assert sorted(delivered) == [0, 1]

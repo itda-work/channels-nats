@@ -78,6 +78,10 @@ class _Mailbox:
     #: consumer behind a process channel is still there.
     active_at: float = field(default_factory=time.monotonic)
     subscription: Subscription | None = None
+    #: Set when ``flush()`` takes this mailbox away. Nothing feeds the queue after
+    #: that, so a receiver waiting on it has to move to the mailbox that replaces
+    #: it instead of waiting for a message that can never arrive.
+    superseded: bool = False
     receivers: int = 0
     dropped: int = 0
     warned_at: float | None = None
@@ -589,6 +593,16 @@ class NatsChannelLayer(BaseChannelLayer):
         try:
             while True:
                 queued_at, payload = await box.queue.get()
+                if box.superseded:
+                    # flush() dropped this mailbox, and what was left in its queue
+                    # went with it. Take up the one that replaced it -- the two
+                    # counter changes have no await between them, so no cancellation
+                    # can land with this read counted on both or on neither.
+                    replacement = await self._mailbox(channel)
+                    replacement.receivers += 1
+                    box.receivers -= 1
+                    box = replacement
+                    continue
                 if time.monotonic() - queued_at > self.expiry:
                     continue
                 return serializers.loads(payload)
@@ -633,6 +647,16 @@ class NatsChannelLayer(BaseChannelLayer):
             if now - box.active_at <= self.mailbox_grace:
                 continue
             del state.mailboxes[channel]
+
+    def _supersede(self, box: _Mailbox) -> None:
+        """Wake the receivers waiting on a mailbox that is being taken away.
+
+        One wake-up per receiver, since each is waiting on its own ``get()``. The
+        entry itself is never read as a message: ``receive()`` sees the flag first.
+        """
+        box.superseded = True
+        for _ in range(box.receivers):
+            box.queue.put_nowait((time.monotonic(), b""))
 
     async def _discard_mailbox(self, channel: str, box: _Mailbox) -> None:
         """Forget a plain channel whose last receiver was cancelled.
@@ -757,6 +781,8 @@ class NatsChannelLayer(BaseChannelLayer):
             *(box.subscription for box in state.mailboxes.values() if box.subscription is not None),
             *state.process_subscriptions.values(),
         ]
+        for box in state.mailboxes.values():
+            self._supersede(box)  # a read already waiting must not be left on a dead queue
         state.group_subscriptions.clear()
         state.group_channel_subscriptions.clear()
         state.process_subscriptions.clear()
