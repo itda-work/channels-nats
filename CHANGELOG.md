@@ -4,6 +4,10 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ## [Unreleased]
 
+### Added
+
+- Python **3.14** 지원. CI 매트릭스에 3.14를 넣고 분류자를 추가했다. 로컬에서 CPython 3.14.7로 전체 테스트를 돌려 확인한 뒤 선언했다
+
 ### Changed
 
 - `extensions`에서 **`flush`를 뺀다** (`["groups"]`). 스펙의 `flush` 확장은 분산 레이어가 모든 클라이언트에 비어 보이기를 요구하는데, 이 `flush()`는 한 인스턴스의 현재 이벤트 루프만 지운다. 메서드는 그대로 두고 선언만 실제에 맞춘다 — Channels 자체는 `extensions`를 읽지 않으므로 프레임워크 동작에는 영향이 없다 (#7)
