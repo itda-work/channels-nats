@@ -1014,11 +1014,23 @@ class NatsChannelLayer(BaseChannelLayer):
             for box in state.mailboxes.values():
                 box.closed = True  # before the drain, so a slow one cannot hold them there
                 self._wake_receivers(box)
+        settling: list[asyncio.Future] = []
         if state is not None:
             for cleanup in list(state.cleanups):
                 cleanup.cancel()  # the connection is going; the subscriptions go with it
+                settling.append(cleanup)
         if state is not None and state.recovery is not None:
             state.recovery.cancel()
+            settling.append(state.recovery)
+        if settling:
+            # A cancelled task is not a finished one until the loop has run it. Under
+            # asyncio.run() the runner would collect them, but a loop that simply stops
+            # -- Twisted's, under daphne -- reports each as destroyed while pending.
+            # Bounded: a task that will not take its cancellation must not hold close().
+            try:
+                await asyncio.wait_for(asyncio.gather(*settling, return_exceptions=True), CLEANUP_GRACE)
+            except asyncio.TimeoutError:
+                log.debug("channels_nats: something did not take its cancellation before close returned")
         if state is not None and state.client is not None and not state.client.is_closed:
             try:
                 await state.client.drain()

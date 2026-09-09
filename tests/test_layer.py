@@ -1186,3 +1186,24 @@ async def test_close_finishes_the_commands_it_cancelled(layer):
         assert all(task.done() for task in handed_off), "close() left a task mid-cancellation"
     finally:
         release.set()
+
+
+async def test_close_settles_the_recovery_it_cancels(layer):
+    """Recovery runs exactly when there is no connection left to drain.
+
+    ``close()`` cancels it and then awaits the drain, which is what gives the loop
+    the turn a cancelled task needs to finish -- but a closed client is not drained,
+    so there is nothing to await and ``close()`` would return with the task still
+    mid-cancellation. Under ``asyncio.run`` the runner cancels it later anyway;
+    under a loop that simply stops, such as Twisted's, it is reported as destroyed
+    while pending.
+    """
+    client = await layer._client()
+    state = layer._state()
+    await client.close()  # the state recovery exists for
+    state.recovery = asyncio.create_task(asyncio.sleep(3600))
+    await asyncio.sleep(0)
+
+    await layer.close()
+
+    assert state.recovery.done(), "close() returned with recovery still mid-cancellation"
