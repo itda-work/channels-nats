@@ -818,3 +818,57 @@ async def test_flush_wakes_every_reader_of_a_shared_channel(layer):
 
     delivered = [(await asyncio.wait_for(reader, 5))["index"] for reader in readers]
     assert sorted(delivered) == [0, 1]
+
+
+async def test_drops_before_the_mailbox_are_reported(make_layer, caplog):
+    """nats-py throws messages away a layer above the mailbox, and used to do it silently.
+
+    A subscription over its pending limits drops on arrival: the message never
+    reaches a mailbox, so no mailbox's ``dropped`` counts it and the operator
+    reads "nothing was dropped" while messages are missing. The limit is lowered
+    here rather than filling the default one (512K messages / 128MB), but the
+    drop itself is nats-py's own path, not a synthesised error.
+    """
+    seen: list[Exception] = []
+
+    async def error_cb(error: Exception) -> None:
+        seen.append(error)
+
+    reader = make_layer(connect_options={"error_cb": error_cb})
+    box = await reader._mailbox("shared")
+    assert box.subscription is not None
+    box.subscription._pending_bytes_limit = 1  # one message is already too much
+
+    sender = make_layer()
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        for index in range(3):
+            await sender.send("shared", {"type": "chat", "index": index})
+        await asyncio.sleep(0.3)
+
+    assert box.queue.qsize() == 0  # nothing arrived
+    assert box.dropped == 0  # and the mailbox has no idea
+
+    warned = [r for r in caplog.records if "slow consumer" in r.getMessage()]
+    assert len(warned) == 1  # first drop warns, the rest are rate-limited like a full mailbox
+    assert reader.channel_subject("shared") in warned[0].getMessage()
+    assert reader._state().slow_consumer_drops == 3
+    assert len(seen) == 3  # the caller's own error_cb still sees every one
+
+
+async def test_errors_still_reach_the_nats_logger_without_an_error_cb(make_layer, caplog):
+    """Installing an error_cb of our own takes nats-py's default out of the way.
+
+    A guard, not a defect: whoever reads the nats logger for connection errors
+    must keep getting them.
+    """
+    reader = make_layer()
+    box = await reader._mailbox("shared")
+    assert box.subscription is not None
+    box.subscription._pending_bytes_limit = 1
+
+    sender = make_layer()
+    with caplog.at_level(logging.ERROR, logger="nats.aio.client"):
+        await sender.send("shared", {"type": "chat"})
+        await asyncio.sleep(0.3)
+
+    assert [record for record in caplog.records if record.name == "nats.aio.client"]

@@ -58,6 +58,7 @@ from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
 from nats.aio.subscription import Subscription
+from nats.errors import SlowConsumerError
 
 from . import serializers
 
@@ -109,6 +110,10 @@ class _LoopState:
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
     swept_at: float = 0.0
+    #: Messages nats-py threw away before they reached a mailbox, so they are in
+    #: no mailbox's ``dropped``. Per connection, which is what the limit is on.
+    slow_consumer_drops: int = 0
+    slow_consumer_warned_at: float | None = None
 
 
 class NatsChannelLayer(BaseChannelLayer):
@@ -220,6 +225,7 @@ class NatsChannelLayer(BaseChannelLayer):
     async def _connect(self, state: _LoopState) -> Client:
         options = dict(self.connect_options)
         given = options.pop("closed_cb", None)
+        given_error = options.pop("error_cb", None)
 
         async def on_closed() -> None:
             # Before the user's callback, not after: one that raises, hangs or gets
@@ -229,7 +235,40 @@ class NatsChannelLayer(BaseChannelLayer):
             if given is not None:
                 await given()
 
-        return await nats.connect(servers=self.servers, closed_cb=on_closed, **options)
+        async def on_error(error: Exception) -> None:
+            if isinstance(error, SlowConsumerError):
+                self._note_slow_consumer(state, error)
+            if given_error is not None:
+                await given_error(error)
+            else:
+                # nats-py installs its own error_cb only when none is given, and this
+                # one takes that place. Keep its line so that anything already reading
+                # the nats logger for other errors does not go quiet.
+                logging.getLogger("nats.aio.client").error("nats: encountered error", exc_info=error)
+
+        return await nats.connect(servers=self.servers, closed_cb=on_closed, error_cb=on_error, **options)
+
+    def _note_slow_consumer(self, state: _LoopState, error: SlowConsumerError) -> None:
+        """Report a message nats-py dropped before it could reach a mailbox.
+
+        The layer counts drops in ``_enqueue``, where its own queue overflows. A
+        subscription that exceeds nats-py's pending limits loses messages a layer
+        above that, so without this the operator reads "nothing was dropped" while
+        messages are missing. Not folded into a mailbox's ``dropped``: the loss is
+        per subscription, and a process subject carries every channel of a process.
+        """
+        state.slow_consumer_drops += 1
+        now = time.monotonic()
+        if state.slow_consumer_warned_at is not None and now - state.slow_consumer_warned_at < self.drop_log_interval:
+            return
+        state.slow_consumer_warned_at = now
+        log.warning(
+            "channels_nats: nats-py dropped a message on %s before it reached a mailbox "
+            "(slow consumer; %d so far on this connection). Raise pending_bytes_limit / "
+            "pending_msgs_limit, or read faster.",
+            error.subject,
+            state.slow_consumer_drops,
+        )
 
     def _start_recovery(self, state: _LoopState) -> None:
         """Come back on our own once nats-py has given up reconnecting.
