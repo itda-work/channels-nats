@@ -10,6 +10,7 @@ from channels.exceptions import MessageTooLarge
 from nats.errors import FlushTimeoutError
 
 from channels_nats import ChannelLayerClosed, NatsChannelLayer
+from channels_nats.layer import _Mailbox
 
 pytestmark = pytest.mark.integration
 
@@ -930,7 +931,7 @@ async def test_a_frame_that_is_not_a_message_does_not_end_the_consumer(layer, ca
         await layer.send("shared", {"type": "good"})
         assert await asyncio.wait_for(layer.receive("shared"), 5) == {"type": "good"}
 
-    warned = [r for r in caplog.records if "not a Channels message" in r.getMessage()]
+    warned = [r for r in caplog.records if "could not be read as a Channels message" in r.getMessage()]
     assert len(warned) == 1  # rate-limited like the other drops
     assert layer._state().bad_frames == 2
 
@@ -1372,3 +1373,114 @@ def test_a_loop_that_closes_while_holding_a_connection_is_reported(nats_url, cap
     # Both were counted; the warning is rate-limited like the other drop reports, so the
     # second is carried by the count rather than by a second line.
     assert orphaned == 2
+
+
+async def test_flush_does_not_strand_a_receive_that_was_still_subscribing(layer):
+    """``flush()`` while the channel's first ``receive()`` is still coming up.
+
+    ``_mailbox()`` registers the box before it subscribes, so ``flush()`` finds it
+    and marks it superseded -- but with no receiver counted yet there is nothing to
+    wake, and ``_mailbox()`` hands that box back anyway. The read then waits on a
+    queue nothing feeds, and ``close()`` cannot reach it either: the box is no longer
+    in ``mailboxes``. Same stranding as #21 and #22, one window earlier.
+    """
+    client = await layer._client()
+    original, subscribed, release = client.flush, asyncio.Event(), asyncio.Event()
+
+    async def gated_flush(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        subscribed.set()  # the server has the subscription; the box is registered
+        await release.wait()
+        return result
+
+    client.flush = gated_flush
+    try:
+        waiting = asyncio.create_task(layer.receive("raceplain"))
+        await asyncio.wait_for(subscribed.wait(), 5)
+
+        await layer.flush()  # takes the mailbox away while the read is still coming up
+    finally:
+        release.set()
+        client.flush = original
+
+    await layer._mailbox("raceplain")  # the channel is established again, however it happens
+    await layer.send("raceplain", {"type": "after"})
+    assert await asyncio.wait_for(waiting, 5) == {"type": "after"}
+
+
+async def test_a_group_add_that_flush_overtook_does_not_leave_its_subscription(layer):
+    """``flush()`` landing while ``group_add`` waits for the server to have its subscription.
+
+    flush clears the memberships, so the group_add that finishes afterwards has
+    nobody to deliver to -- but it recorded its subscription anyway, and the server
+    kept sending that group's traffic to a callback with an empty member list.
+    ``_resubscribe`` already re-checks before it writes a subscription back; this
+    path did not.
+    """
+    channel = await layer.new_channel()
+    client = await layer._client()
+    original, waiting_on_server, release = client.flush, asyncio.Event(), asyncio.Event()
+
+    async def gated_flush(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        waiting_on_server.set()
+        await release.wait()
+        return result
+
+    client.flush = gated_flush
+    try:
+        adding = asyncio.create_task(layer.group_add("room", channel))
+        await asyncio.wait_for(waiting_on_server.wait(), 5)
+
+        await layer.flush()  # the membership goes while the subscription is being confirmed
+    finally:
+        release.set()
+        client.flush = original
+    await adding
+
+    state = layer._state()
+    assert not state.groups.get("room"), "flush should have cleared the membership"
+    assert "room" not in state.group_subscriptions, "a group subscription with no member was kept"
+
+
+async def test_a_message_this_layer_cannot_read_back_is_reported_without_blame(layer, caplog):
+    """msgpack packs a non-string map key and then refuses to unpack it.
+
+    So a frame this layer sent can arrive unreadable, and the report used to say
+    "something other than this layer is publishing to its subjects" -- which sends
+    whoever is diagnosing it looking for a publisher that does not exist.
+    """
+    channel = await layer.new_channel()
+    with caplog.at_level(logging.WARNING, logger="channels_nats"):
+        await layer.send(channel, {"type": "test.message", "nested": {1: "packs but does not unpack"}})
+        await layer.send(channel, {"type": "test.message", "text": "readable"})
+        assert await asyncio.wait_for(layer.receive(channel), 5) == {
+            "type": "test.message",
+            "text": "readable",
+        }
+
+    dropped = [record.message for record in caplog.records if "could not be read" in record.message]
+    assert dropped, [record.message for record in caplog.records]
+    assert "Either something else is publishing" in dropped[0], dropped[0]
+
+
+async def test_a_full_mailbox_still_reclaims_what_has_expired(make_layer):
+    """The sweep is skipped while nothing can be reclaimed, not when something can.
+
+    Emptying a full queue to refill it costs the whole queue on every message that
+    arrives past capacity -- 8.7 ms each at capacity 50,000, measured. The mailbox
+    keeps the oldest arrival so that cost is only paid when it can buy something.
+    """
+    layer = make_layer(capacity=3, expiry=0.2)
+    box = _Mailbox(queue=asyncio.Queue())
+    for _ in range(3):
+        box.queue.put_nowait((time.monotonic(), b"first"))
+
+    layer._enqueue(box, "full", b"turned away")  # nothing has expired yet
+    assert box.queue.qsize() == 3 and box.dropped == 1
+
+    await asyncio.sleep(0.25)  # now everything in there is past expiry
+    layer._enqueue(box, "full", b"takes their place")
+
+    assert box.queue.qsize() == 1, "the expired messages were not reclaimed"
+    assert box.queue.get_nowait()[1] == b"takes their place"

@@ -117,6 +117,9 @@ class _Mailbox:
     #: mailbox, so a receiver waiting on it ends with ``ChannelLayerClosed``.
     closed: bool = False
     receivers: int = 0
+    #: When the oldest message still in the queue arrived, as far as the last sweep
+    #: knows. Reading it costs nothing and says whether a sweep could reclaim anything.
+    oldest_at: float | None = None
     dropped: int = 0
     warned_at: float | None = None
 
@@ -683,8 +686,18 @@ class NatsChannelLayer(BaseChannelLayer):
     def _drop_expired(self, box: _Mailbox, now: float) -> None:
         """Reclaim the room taken by messages ``receive()`` would throw away anyway.
 
-        Synchronous, so the queue is never seen half drained.
+        Synchronous, so the queue is never seen half drained. It runs on every message
+        that arrives at a full mailbox, and emptying a queue to refill it costs the
+        whole queue -- 8.7 ms per message at ``capacity`` 50,000, measured, on a loop
+        that has other work. So the oldest arrival is kept: while it is inside
+        ``expiry`` nothing in there can be reclaimed and the sweep is skipped.
+
+        The mark can only be older than the true oldest, never newer -- ``receive()``
+        takes from the front -- so a stale one costs one sweep that finds nothing and
+        then corrects itself. It never skips a sweep that had something to reclaim.
         """
+        if box.oldest_at is not None and now - box.oldest_at <= self.expiry:
+            return
         kept = []
         while not box.queue.empty():
             entry = box.queue.get_nowait()
@@ -692,6 +705,7 @@ class NatsChannelLayer(BaseChannelLayer):
                 kept.append(entry)
         for entry in kept:
             box.queue.put_nowait(entry)
+        box.oldest_at = kept[0][0] if kept else None
 
     def _enqueue(self, box: _Mailbox, channel: str, payload: bytes) -> None:
         """Queue the encoded message.
@@ -814,7 +828,11 @@ class NatsChannelLayer(BaseChannelLayer):
         cancelled = False
         try:
             while True:
-                queued_at, payload = await box.queue.get()
+                # Both flags are read before waiting, not after. A mailbox can be taken
+                # away while this read is still coming up -- _mailbox() registers the box
+                # before it subscribes, so flush() reaches it while no receiver is
+                # counted yet and there is nobody to wake. Checked here, the read never
+                # settles on a queue that has already been abandoned.
                 if box.closed:
                     # close() dropped the state this mailbox belonged to. Unlike a
                     # superseded one it has no replacement to move to, and asking for
@@ -830,6 +848,7 @@ class NatsChannelLayer(BaseChannelLayer):
                     box.receivers -= 1
                     box = replacement
                     continue
+                queued_at, payload = await box.queue.get()
                 if time.monotonic() - queued_at > self.expiry:
                     continue
                 message = self._decode(channel, payload)
@@ -854,7 +873,10 @@ class NatsChannelLayer(BaseChannelLayer):
         contract. Letting it out of ``receive()`` would end a consumer that did
         nothing wrong -- and on a group subject one bad publish would end every
         member -- so it is dropped like an expired message and reported instead.
-        Messages this layer sent are checked at ``send()``, which asserts a dict.
+        ``send()`` asserts a dict, which is not the same as "this can be read back":
+        msgpack packs a map key that is not a string and then refuses to unpack it,
+        so a message from this layer can arrive unreadable too (measured). The frame
+        is dropped either way; what the report must not do is name a culprit.
         """
         try:
             message = serializers.loads(payload)
@@ -870,9 +892,11 @@ class NatsChannelLayer(BaseChannelLayer):
         if state.bad_frame_warned_at is None or now - state.bad_frame_warned_at >= self.drop_log_interval:
             state.bad_frame_warned_at = now
             log.warning(
-                "channels_nats: dropped a frame on %s that is not a Channels message "
-                "(%s); %d so far. Something other than this layer is publishing to "
-                "its subjects.",
+                "channels_nats: dropped a frame on %s that could not be read as a Channels "
+                "message (%s); %d so far. Either something else is publishing to these "
+                "subjects, or it came from this layer: msgpack packs some values it will "
+                "not unpack, a map key that is not a string among them, and send() does "
+                "not catch that.",
                 channel,
                 reason,
                 state.bad_frames,
@@ -982,6 +1006,14 @@ class NatsChannelLayer(BaseChannelLayer):
                     state.groups.pop(group, None)
             raise
 
+    def _group_wants(self, state: _LoopState, group: str, kind: str) -> bool:
+        """Whether the group still has a member that the given subscription serves.
+
+        ``kind`` is ``"!"`` for the group subscription, which feeds this process's own
+        channels; a plain member is fed by a queue subscription of its own.
+        """
+        return any(kind in member for member in state.groups.get(group, ()))
+
     def _group_delivers_to(self, state: _LoopState, group: str, channel: str) -> bool:
         """Whether a subscription that would feed ``channel`` for ``group`` exists."""
         if "!" in channel:
@@ -998,6 +1030,13 @@ class NatsChannelLayer(BaseChannelLayer):
                     client, self.group_subject(group), cb=self._group_deliver(state, group)
                 )
                 await self._flush_or_undo(client, subscription)
+                if not self._group_wants(state, group, "!"):
+                    # flush() (or the last group_discard) ran while the server was
+                    # confirming this. Recording it now would leave a subscription
+                    # taking the group's traffic for a member that is gone --
+                    # _resubscribe() re-checks for the same reason.
+                    await self._unsubscribe([subscription])
+                    return
                 state.group_subscriptions[group] = subscription
             else:
                 # A plain channel read by several processes is still one channel, so
@@ -1012,6 +1051,9 @@ class NatsChannelLayer(BaseChannelLayer):
                     cb=self._group_channel_deliver(state, channel),
                 )
                 await self._flush_or_undo(client, subscription)
+                if channel not in state.groups.get(group, ()):
+                    await self._unsubscribe([subscription])  # the membership went; see above
+                    return
                 state.group_channel_subscriptions[group, channel] = subscription
 
     async def group_discard(self, group: str, channel: str) -> None:
@@ -1023,7 +1065,7 @@ class NatsChannelLayer(BaseChannelLayer):
             return
         members.discard(channel)
         stale = [state.group_channel_subscriptions.pop((group, channel), None)]
-        if not any("!" in member for member in members):
+        if not self._group_wants(state, group, "!"):
             # The group subscription is there for this process's own channels; a
             # plain member is served by its own queue subscription instead. Held past
             # the last one, it takes delivery of everything the group publishes only
