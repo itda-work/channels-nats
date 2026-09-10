@@ -6,7 +6,8 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Changed
 
-- **"daphne 종료가 멈춘다"는 서술을 내렸다.** 0.7.0이 되살리는 그 취소가 종료 정지로 이어진다고 README에 적었는데, **실물 daphne로는 재현되지 않았다** — 최소 Channels 앱을 daphne로 띄우고 실제 websocket으로 붙어, 브로커를 세워 컨슈머를 `group_send` 안에 수 초간 붙들어 둔 상태로 SIGTERM을 보냈다. 취소는 `CancelledError`로 정상 전파되고 daphne는 0.1~0.2초에 종료했다 — 가드가 없는 0.6.1에서도 같았다(연결 1개·2개, 버스트·지속 포화 네 조합). 삼킴 자체는 격리된 조건에서 여전히 재현되므로 가드는 그대로 두고, 그 결과에 대한 주장만 사실에 맞췄다 (#23)
+- **"daphne 종료가 멈춘다"를 다시 세운다 — 실물로 확인했다.** 직전 항목에서 이 서술을 내렸는데, **그 철회가 틀렸다.** 실물 daphne가 0.1초에 종료한 이유는 취소가 잘 전파돼서가 아니라 **daphne가 아무것도 취소하지 않았기** 때문이다: `Server.kill_all_applications()`는 `details["application_instance"]`로 키를 직접 읽는데 `application_checker()`가 그 키를 지우므로, 우리 실행에서 `KeyError('application_instance')`를 내고 죽었다(Twisted가 종료 트리거의 예외를 삼킨다). 그 함수를 `.get()` 판으로 바꿔 daphne의 원래 의도대로 돌리자 결과가 갈렸다 — **0.6.1: 취소가 `_flush_pending`에서 삼켜지고(`cancelling()` 0 → 1) 종료가 30초 안에 끝나지 않음. 현재 레이어: 같은 조건에서 gather가 0.4 ms 만에 완료되고 daphne는 0.1초에 종료.** 컨슈머가 그 대기 지점에 서 있었다는 것도 await 체인으로 확인했다 (#23)
+- ~~**"daphne 종료가 멈춘다"는 서술을 내렸다.**~~ 0.7.0이 되살리는 그 취소가 종료 정지로 이어진다고 README에 적었는데, **실물 daphne로는 재현되지 않았다** — 최소 Channels 앱을 daphne로 띄우고 실제 websocket으로 붙어, 브로커를 세워 컨슈머를 `group_send` 안에 수 초간 붙들어 둔 상태로 SIGTERM을 보냈다. 취소는 `CancelledError`로 정상 전파되고 daphne는 0.1~0.2초에 종료했다 — 가드가 없는 0.6.1에서도 같았다(연결 1개·2개, 버스트·지속 포화 네 조합). 삼킴 자체는 격리된 조건에서 여전히 재현되므로 가드는 그대로 두고, 그 결과에 대한 주장만 사실에 맞췄다 (#23)
 
 ## [0.7.1] - 2026-09-10
 
