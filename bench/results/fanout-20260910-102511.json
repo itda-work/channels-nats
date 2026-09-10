@@ -1,0 +1,25 @@
+{
+ "nats": {
+  "members": 1000,
+  "processes": 4,
+  "messages": 50,
+  "deliveries": 50000,
+  "delivered": 50000,
+  "p50_ms": 0.7219314575195312,
+  "p95_ms": 1.153707504272461,
+  "p99_ms": 1.5490055084228516,
+  "max_ms": 1.8062591552734375,
+  "deliveries_per_s": 92665.50662751167,
+  "wall_s": 0.5395750999450684
+ },
+ "in_memory": {
+  "group_send_ms": 64.23613833962008,
+  "deliveries_per_s": 15567.560968764088
+ },
+ "measured": {
+  "channels_nats": "0.7.1",
+  "revision": "v0.7.1",
+  "python": "3.14.7",
+  "nats_server": "nats-server: v2.14.6"
+ }
+}
