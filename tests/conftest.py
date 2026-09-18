@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -38,7 +39,20 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(port: int, timeout: float = 15.0) -> None:
+def _start_server(command: list[str]) -> subprocess.Popen:
+    """Start a nats-server keeping what it says, so a failure to come up can say why.
+
+    Its output used to go to DEVNULL; a CI job then died on "nats-server did not
+    start" with nothing to go on. The log is a temp file rather than a pipe, since
+    a pipe nobody drains would stall the server once it filled.
+    """
+    log = tempfile.TemporaryFile(mode="w+")
+    process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+    process.log = log  # type: ignore[attr-defined]
+    return process
+
+
+def _wait_for_port(port: int, process: subprocess.Popen | None = None, timeout: float = 15.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -46,7 +60,13 @@ def _wait_for_port(port: int, timeout: float = 15.0) -> None:
                 return
         except OSError:
             time.sleep(0.05)
-    raise RuntimeError("nats-server did not start")
+    said = ""
+    log = getattr(process, "log", None)
+    if log is not None:
+        log.seek(0)
+        said = log.read()[-2000:]
+    exited = f" (exited with {process.returncode})" if process is not None and process.poll() is not None else ""
+    raise RuntimeError(f"nats-server did not start on port {port}{exited}. It said:\n{said}")
 
 
 @pytest.fixture(scope="session")
@@ -55,11 +75,9 @@ def nats_url():
     if binary is None:
         pytest.skip("nats-server binary not found (set NATS_SERVER or put it on PATH)")
     port = _free_port()
-    proc = subprocess.Popen(
-        [binary, "-a", "127.0.0.1", "-p", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    proc = _start_server([binary, "-a", "127.0.0.1", "-p", str(port)])
     try:
-        _wait_for_port(port)
+        _wait_for_port(port, proc)
         yield f"nats://127.0.0.1:{port}"
     finally:
         proc.terminate()
@@ -93,10 +111,8 @@ class _Cluster:
 
     def start(self, index: int) -> None:
         """Bring a node up on the ports it had; a restarted node rejoins by route."""
-        self.processes[index] = subprocess.Popen(
-            self.commands[index], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        _wait_for_port(self.client_ports[index])
+        self.processes[index] = _start_server(self.commands[index])
+        _wait_for_port(self.client_ports[index], self.processes[index])
         _wait_for_routes(self.monitor_ports[index], expected=len(self.commands) - 1)
 
     def stop(self, index: int) -> None:
@@ -155,11 +171,9 @@ def nats_cluster():
     )
     try:
         for index in range(3):
-            cluster.processes[index] = subprocess.Popen(
-                cluster.commands[index], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        for port in client_ports:
-            _wait_for_port(port)
+            cluster.processes[index] = _start_server(cluster.commands[index])
+        for index, port in enumerate(client_ports):
+            _wait_for_port(port, cluster.processes[index])
         for port in monitor_ports:
             _wait_for_routes(port, expected=2)
         yield cluster

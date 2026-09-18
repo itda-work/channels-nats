@@ -40,3 +40,23 @@ def test_go_install_binary_is_found_on_windows(no_nats_server_around):
 
 def test_nothing_installed_means_nothing_found(no_nats_server_around):
     assert find_nats_server() is None
+
+
+def test_a_server_that_does_not_start_says_why():
+    """The fixture used to send nats-server's output to DEVNULL, and a CI job died
+    on "nats-server did not start" with nothing else to go on."""
+    from conftest import _free_port, _start_server, _wait_for_port
+
+    binary = find_nats_server()
+    if binary is None:
+        pytest.skip("nats-server binary not found")
+    process = _start_server([binary, "--no-such-flag"])
+    try:
+        with pytest.raises(RuntimeError) as failure:
+            _wait_for_port(_free_port(), process, timeout=2)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    message = str(failure.value)
+    assert "exited with" in message, message
+    assert len(message.split("It said:", 1)[1].strip()) > 100, message  # its usage text, not silence
