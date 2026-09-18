@@ -318,7 +318,15 @@ class NatsChannelLayer(BaseChannelLayer):
         given = options.pop("closed_cb", None)
         given_error = options.pop("error_cb", None)
 
+        came_up = False
+
         async def on_closed() -> None:
+            if not came_up:
+                # The layer closing a client whose connect failed or was cancelled.
+                # Nobody was ever given it, so nothing was lost and there is nothing to
+                # recover: recovering here kept connecting on behalf of a caller that
+                # had already left, one socket after another (#27).
+                return
             # Before the user's callback, not after: one that raises, hangs or gets
             # cancelled would otherwise take the layer's own safety net with it, and
             # a receive-only process has nothing else that would notice.
@@ -352,6 +360,7 @@ class NatsChannelLayer(BaseChannelLayer):
             # holding the connection. A fresh task has no cancellation to trip over.
             self._finish_later(self._close_quietly(client))
             raise
+        came_up = True
         return client
 
     async def _close_quietly(self, client: Client) -> None:
@@ -361,12 +370,6 @@ class NatsChannelLayer(BaseChannelLayer):
             await asyncio.wait_for(client.close(), CLEANUP_GRACE)
         except (Exception, asyncio.TimeoutError) as error:
             log.debug("channels_nats: could not close a connection that never came up: %s", error)
-        # This releases a connect that failed or timed out. A connect that was
-        # *cancelled* is not released by it -- close() returns with is_closed set and
-        # the peer still holding the socket, which then waits for the garbage
-        # collector (measured; closing the transport by hand does not help either).
-        # One socket per cancelled connect, where the retry loop's failures used to
-        # pile up one per attempt.
 
     def _note_slow_consumer(self, state: _LoopState, error: SlowConsumerError) -> None:
         """Report a message nats-py dropped before it could reach a mailbox.

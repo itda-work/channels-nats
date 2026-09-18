@@ -1299,6 +1299,60 @@ async def test_connects_that_time_out_do_not_pile_up_sockets():
             await asyncio.wait_for(server.wait_closed(), 5)
 
 
+@pytest.mark.parametrize("ending", ["cancelled", "timed out"])
+async def test_a_connect_that_never_came_up_does_not_start_a_reconnect(ending):
+    """Closing a client nobody received must not look like losing a connection.
+
+    The layer closes a client whose connect failed or was cancelled, and nats-py
+    answers a close with ``closed_cb`` -- the layer's cue to start recovering. So
+    giving up on a connect started a background loop that kept connecting on behalf
+    of a caller who had left: measured against a server that accepts and stays
+    silent, the cancelled connect's own socket was released and a second one, opened
+    by ``_recover()``, took its place (#27 read that as the first socket lingering).
+
+    The server here is a plain asyncio one; no nats-server is involved.
+    """
+    accepted: list = []
+
+    async def silent(reader, writer):
+        accepted.append(writer)
+        await reader.read(1)  # never send INFO
+        writer.close()
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{port}",
+        connect_options={
+            "connect_timeout": 30 if ending == "cancelled" else 1,
+            "allow_reconnect": False,
+            "max_reconnect_attempts": 0,
+        },
+    )
+    try:
+        connecting = asyncio.create_task(layer.new_channel())
+        if ending == "cancelled":
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if accepted:
+                    break
+            assert connecting.cancel(), "the connect should still have been waiting for INFO"
+        with pytest.raises((asyncio.CancelledError, Exception)):
+            await connecting
+
+        await asyncio.sleep(1.5)  # room for the close, and for a reconnect if one was started
+        state = layer._state()
+        assert state.recovery is None, "giving up on a connect started the recovery loop"
+        assert len(accepted) == 1, f"{len(accepted) - 1} connection(s) opened after the caller gave up"
+    finally:
+        await layer.close()
+        for writer in accepted:
+            writer.close()
+        server.close()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(server.wait_closed(), 5)
+
+
 async def test_a_plain_channel_in_a_group_survives_a_reconnect(make_layer, caplog):
     """A shared channel name in a group takes each message once, not once per process.
 

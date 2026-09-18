@@ -6,6 +6,8 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Fixed
 
+- **포기한 connect가 백그라운드 재접속 루프를 시작했다.** 레이어는 성립하지 못한 connect의 client를 닫는데(0.7.1), nats-py는 close에 `closed_cb`로 답하고 그것은 레이어가 복구를 시작하는 신호다. 그래서 **connect가 실패하거나 취소되면 `_recover()`가 떠서, 이미 떠난 호출자를 대신해 연결될 때까지 계속 접속했다** — 시도마다 소켓 하나, 최대 `connect_timeout` 동안. **0.7.1이 "취소된 connect의 소켓은 GC 때까지 남는다"고 적은 것은 오진이었다**(#27): peer별로 다시 재니 취소된 connect의 소켓은 정상 해제됐고(EOF), 남아 있던 것은 `_recover()`가 새로 연 두 번째 연결이었다. "`close()`도 transport를 직접 닫는 것도 통하지 않는다"던 관측도 그래서다 — 닫을 것은 이미 닫혀 있었다. 이제 `on_closed`는 한 번이라도 넘겨준 client가 닫혔을 때만 복구를 시작한다. 넘겨준 적 없는 client의 close에는 사용자의 `closed_cb`도 부르지 않는다 — `nats.connect()`가 실패할 때 부르지 않는 것과 같다. 타임아웃 쪽도 같은 결함이었다: 0.7.1의 테스트는 소켓이 **0이 되는 순간이 있는지**만 봐서 그 뒤에 도는 재접속 루프를 잡지 못했다. 새 테스트는 호출자가 포기한 뒤 열린 연결 수를 센다 (#27)
+
 - **nats-py가 삼킨 취소를 되살리는 가드가 `flush()` 경로에는 없었다.** 0.7.0의 가드는 재현한 publish 경로만 덮었고, 같은 `_flush_pending()`에 닿는 나머지 경로는 "그 지점에 태스크를 세우지 못해 관측 가능한지조차 모른다"로 남겨 뒀다(#23). 이번에 세웠다 — `Client.flush()`는 PING을 transport에 직접 쓰므로 강제 flush는 타지 않지만, **flush 큐(기본 1024)가 차 있으면 `_flush_queue.put()`에서 멈추고** 거기 온 취소는 버려진다. 큐는 publish로는 차지 않고(빌 때만 넣는다) subscribe·unsubscribe·ping이 하나씩 채운다. nats-py 기본값 그대로 실제 서버에서 재현: flusher를 `drain()`에 세우고 `flush()` 1,023건으로 큐를 채운 뒤 `_mailbox()`를 부르자 `_send_ping → _flush_pending → Queue.put`에 섰고, 취소 뒤 `cancelled=False`로 **멀쩡한 mailbox를 돌려받았다**(`cancelling()` 0 → 1). 레이어가 호출자 태스크에서 직접 `flush()`를 부르는 자리는 셋 — 일반 채널 mailbox, 프로세스 구독 확인, 재접속 복원 — 이고 이제 전부 publish와 같은 가드를 지난다. 되살린 취소는 기존 정리 경로(`except BaseException`)를 타므로 만들다 만 구독은 해지된다. **subscribe·unsubscribe는 해당 없다** — 레이어가 자식 태스크 + shield로 감싸므로 호출자의 취소가 nats-py 안에 들어가지 않는다(코드상 확인) (#23)
 
 ## [0.7.2] - 2026-09-18
