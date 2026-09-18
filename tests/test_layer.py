@@ -1484,3 +1484,39 @@ async def test_a_full_mailbox_still_reclaims_what_has_expired(make_layer):
 
     assert box.queue.qsize() == 1, "the expired messages were not reclaimed"
     assert box.queue.get_nowait()[1] == b"takes their place"
+
+
+async def test_a_new_channel_that_flush_overtook_does_not_leave_its_subscription(layer):
+    """``flush()`` landing while ``new_channel`` waits for the server to confirm.
+
+    ``_process_subscription`` recorded its subscription after that wait without
+    looking whether flush had been through -- the group paths and ``_resubscribe``
+    all re-check, this one did not. What was left was a process subscription with
+    no mailbox behind it, and a channel name handed out whose mailbox was gone, so
+    the "subscribe now so nothing sent before the first receive is lost" promise
+    of ``new_channel()`` did not hold for it.
+    """
+    client = await layer._client()
+    original, at_server, release = client.flush, asyncio.Event(), asyncio.Event()
+
+    async def gated_flush(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        at_server.set()
+        await release.wait()
+        return result
+
+    client.flush = gated_flush
+    try:
+        opening = asyncio.create_task(layer.new_channel())
+        await asyncio.wait_for(at_server.wait(), 5)
+        await layer.flush()  # everything goes while the subscription is being confirmed
+    finally:
+        release.set()
+        client.flush = original
+
+    channel = await opening  # started over after the flush, so this one has a mailbox
+    state = layer._state()
+    assert channel in state.mailboxes, "new_channel() handed out a channel whose mailbox flush had taken"
+    assert len(state.process_subscriptions) == 1
+    await layer.send(channel, {"type": "test.message"})
+    assert await asyncio.wait_for(layer.receive(channel), 5) == {"type": "test.message"}

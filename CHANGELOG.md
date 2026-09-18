@@ -4,6 +4,10 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ## [Unreleased]
 
+### Fixed
+
+- **`flush()`가 지나가도 진행 중이던 프로세스 구독이 되살아나 기록됐다.** `_process_subscription()`은 서버 확인을 기다린 뒤 flush가 지나갔는지 보지 않고 기록했다 — 같은 부류의 **다섯 번째** 자리였다(`_resubscribe` 네 곳과 그룹 두 곳은 재검사가 있었다). 결과는 mailbox 없는 프로세스 구독, 그리고 **`new_channel()`이 flush가 지운 mailbox의 채널 이름을 돌려주는 것** — "첫 `receive()` 전 발행분을 잃지 않게 지금 구독한다"는 자기 보증이 깨졌다(실제 서버로 재현). 이제 `_LoopState`에 **세대**가 있어 `flush()`가 올리고, mailbox를 만드는 쪽은 await 전후로 세대를 대조해 flush가 지나갔으면 만든 것을 해지하고 **처음부터 다시 한다** — 호출자는 mailbox가 있는 채널을 받는다. 자리마다 손으로 쓰던 "아직 유효한가" 검사를 이 부류에 대해서는 한 규칙으로 바꾼 것이다 (#29)
+
 ### Changed
 
 - **"daphne 종료가 멈춘다"를 다시 세운다 — 실물로 확인했다.** 직전 항목에서 이 서술을 내렸는데, **그 철회가 틀렸다.** 실물 daphne가 0.1초에 종료한 이유는 취소가 잘 전파돼서가 아니라 **daphne가 아무것도 취소하지 않았기** 때문이다: `Server.kill_all_applications()`는 `details["application_instance"]`로 키를 직접 읽는데 `application_checker()`가 그 키를 지우므로, 우리 실행에서 `KeyError('application_instance')`를 내고 죽었다(Twisted가 종료 트리거의 예외를 삼킨다). 그 함수를 `.get()` 판으로 바꿔 daphne의 원래 의도대로 돌리자 결과가 갈렸다 — **0.6.1: 취소가 `_flush_pending`에서 삼켜지고(`cancelling()` 0 → 1) 종료가 30초 안에 끝나지 않음. 현재 레이어: 같은 조건에서 gather가 0.4 ms 만에 완료되고 daphne는 0.1초에 종료.** 컨슈머가 그 대기 지점에 서 있었다는 것도 await 체인으로 확인했다 (#23)

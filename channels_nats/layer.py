@@ -145,6 +145,10 @@ class _LoopState:
     group_channel_subscriptions: dict[tuple[str, str], Subscription] = field(default_factory=dict)
     process_subscriptions: dict[str, Subscription] = field(default_factory=dict)
     recovery: asyncio.Task | None = None
+    #: Bumped by ``flush()``. Anything that registered before an await and records
+    #: after it compares this instead of guessing whether a flush went through in
+    #: between -- five sites did that by hand, and the fifth had been forgotten (#29).
+    generation: int = 0
     #: Commands that outlived the caller that was cancelled, kept so that close()
     #: can take them down rather than leaving one pending at loop shutdown.
     cleanups: set[asyncio.Future] = field(default_factory=set)
@@ -757,48 +761,60 @@ class NatsChannelLayer(BaseChannelLayer):
             )
         state = self._state()
         self._sweep_mailboxes(state)
-        while (box := state.mailboxes.get(channel)) is not None:
-            await box.ready.wait()
-            if box.subscribed:
+        while True:
+            while (box := state.mailboxes.get(channel)) is not None:
+                await box.ready.wait()
+                if box.subscribed:
+                    return box
+                # Whoever created it failed to subscribe and took it out again; the
+                # error was theirs to raise, so try once more on our own behalf.
+            # Subscribing takes a round trip, and connecting takes several. Without
+            # this lock, consumers arriving together each get past the check above
+            # and each subscribe, so one message arrives once per racing caller.
+            async with state.subscribe_lock:
+                box = state.mailboxes.get(channel)
+                if box is not None:  # somebody won the race while we waited
+                    return box  # and finished under this lock, so it is subscribed
+                box = _Mailbox(queue=asyncio.Queue())
+                state.mailboxes[channel] = box
+                generation = state.generation
+                try:
+                    if "!" in channel:
+                        await self._process_subscription(channel, generation)
+                    else:
+                        client = await self._client()
+                        box.subscription = await self._subscribe(
+                            client,
+                            self.channel_subject(channel),
+                            queue=self.channel_queue_group(channel),
+                            cb=self._channel_deliver(box, channel),
+                        )
+                        await client.flush()  # the server knows about the subscription before we return
+                except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
+                    if state.mailboxes.get(channel) is box:
+                        del state.mailboxes[channel]
+                    box.ready.set()  # after the removal, so a waiter retrying cannot find it again
+                    if box.subscription is not None:
+                        await self._unsubscribe([box.subscription])
+                    raise
+                box.ready.set()
+                if state.generation != generation:
+                    # flush() went through while the server was confirming this, and
+                    # took the box with it. Handing it out would give the caller a
+                    # mailbox nothing feeds -- new_channel() promises the opposite --
+                    # so what was made is taken down and the whole thing starts over.
+                    if box.subscription is not None:
+                        await self._unsubscribe([box.subscription])
+                    continue
+                box.subscribed = True
                 return box
-            # Whoever created it failed to subscribe and took it out again; the error
-            # was theirs to raise, so try once more on our own behalf.
-        # Subscribing takes a round trip, and connecting takes several. Without this
-        # lock, consumers arriving together each get past the check above and each
-        # subscribe, so one message arrives once per racing caller.
-        async with state.subscribe_lock:
-            box = state.mailboxes.get(channel)
-            if box is not None:  # somebody won the race while we waited
-                return box  # and finished under this lock, so it is subscribed
-            box = _Mailbox(queue=asyncio.Queue())
-            state.mailboxes[channel] = box
-            try:
-                if "!" in channel:
-                    await self._process_subscription(channel)
-                else:
-                    client = await self._client()
-                    box.subscription = await self._subscribe(
-                        client,
-                        self.channel_subject(channel),
-                        queue=self.channel_queue_group(channel),
-                        cb=self._channel_deliver(box, channel),
-                    )
-                    await client.flush()  # the server knows about the subscription before we return
-            except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
-                if state.mailboxes.get(channel) is box:
-                    del state.mailboxes[channel]
-                box.ready.set()  # after the removal, so a waiter retrying cannot find it again
-                if box.subscription is not None:
-                    await self._unsubscribe([box.subscription])
-                raise
-            box.subscribed = True
-            box.ready.set()
-            return box
 
-    async def _process_subscription(self, channel: str) -> None:
+    async def _process_subscription(self, channel: str, generation: int) -> None:
         """One subscription per process prefix, routing by the ``Channel`` header.
 
         Only called with ``subscribe_lock`` held, which is what keeps it to one.
+        ``generation`` is the caller's; a flush in between means the mailbox this
+        was for is gone, and the caller starts over rather than record it.
         """
         state = self._state()
         subject = self.process_subject(channel)
@@ -807,6 +823,9 @@ class NatsChannelLayer(BaseChannelLayer):
         client = await self._client()
         subscription = await self._subscribe(client, subject, cb=self._process_deliver(state))
         await self._flush_or_undo(client, subscription)
+        if state.generation != generation:
+            await self._unsubscribe([subscription])  # flush cleared what it would serve
+            return
         # Recorded only once the server has it. Recording first and flushing after
         # left a cancelled flush looking established: the entry stayed, the next
         # caller took the early return above, and nothing ever confirmed the SUB.
@@ -1105,6 +1124,7 @@ class NatsChannelLayer(BaseChannelLayer):
         state.process_subscriptions.clear()
         state.mailboxes.clear()
         state.groups.clear()
+        state.generation += 1  # whoever is mid-subscribe now knows this happened
         await self._unsubscribe(stale)
 
     async def close(self) -> None:
