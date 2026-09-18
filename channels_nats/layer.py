@@ -467,7 +467,7 @@ class NatsChannelLayer(BaseChannelLayer):
             else:
                 stale.append(subscription)
         await self._unsubscribe(stale)
-        await client.flush()
+        await self._flush(client)
         log.warning(
             "channels_nats: the NATS connection was closed; reconnected and restored %d subscriptions",
             len(state.process_subscriptions)
@@ -639,7 +639,7 @@ class NatsChannelLayer(BaseChannelLayer):
         caller is about to fail, so it must not be left on the connection.
         """
         try:
-            await client.flush()
+            await self._flush(client)
         except BaseException:
             await self._unsubscribe([subscription])
             raise
@@ -691,19 +691,33 @@ class NatsChannelLayer(BaseChannelLayer):
                 f"message is {size} bytes on the wire, over the server's max_payload of "
                 f"{client.max_payload}; raise max_payload on nats-server or send less"
             )
+        await self._keeping_cancellation(client.publish(subject, payload, headers=headers))
+
+    async def _flush(self, client: Client) -> None:
+        """``Client.flush()``, with a cancellation it swallowed put back."""
+        await self._keeping_cancellation(client.flush())
+
+    async def _keeping_cancellation[T](self, command: t.Awaitable[T]) -> T:
+        """Await a nats-py command; if it discarded our cancellation, raise it here.
+
+        nats-py's ``_flush_pending()`` ends with ``except asyncio.CancelledError:
+        pass``, so a cancellation delivered while a command waits on the flusher is
+        thrown away and the command returns as if nothing happened -- a consumer
+        cancelled at shutdown goes back to its loop and never ends (#23; the real fix
+        is upstream's to make). Both ``publish()`` and ``flush()`` reach it, on the
+        caller's own task: publish through the forced flush past ``pending_size``,
+        flush through ``_flush_queue.put()`` once the queue is full. Both reproduced
+        against a real server with nats-py's defaults. It does not ``uncancel()``, so
+        the request stays counted, which is the only trace it leaves. The command
+        itself may well have gone out; what is restored is the caller's cancellation,
+        not the message.
+        """
         task = asyncio.current_task()
         requested = task.cancelling() if task is not None else 0
-        await client.publish(subject, payload, headers=headers)
+        result = await command
         if task is not None and task.cancelling() > requested:
-            # nats-py's _flush_pending() ends with `except asyncio.CancelledError:
-            # pass`, so a cancellation delivered while a publish waits for the flusher
-            # is discarded and publish() returns as if nothing happened -- a consumer
-            # cancelled at shutdown goes back to its loop and never ends (#23; the
-            # real fix is upstream's to make). It does not uncancel(), so the request is
-            # counted here, which is the only trace it leaves. The publish itself may
-            # well have gone out; what is restored is the caller's cancellation, not
-            # the message.
             raise asyncio.CancelledError
+        return result
 
     def _drop_expired(self, box: _Mailbox, now: float) -> None:
         """Reclaim the room taken by messages ``receive()`` would throw away anyway.
@@ -807,7 +821,7 @@ class NatsChannelLayer(BaseChannelLayer):
                             queue=self.channel_queue_group(channel),
                             cb=self._channel_deliver(box, channel),
                         )
-                        await client.flush()  # the server knows about the subscription before we return
+                        await self._flush(client)  # the server knows about the subscription before we return
                 except BaseException:  # a cancelled subscribe must not leave a mailbox nothing feeds
                     if state.mailboxes.get(channel) is box:
                         del state.mailboxes[channel]

@@ -2,6 +2,12 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
+## [Unreleased]
+
+### Fixed
+
+- **nats-py가 삼킨 취소를 되살리는 가드가 `flush()` 경로에는 없었다.** 0.7.0의 가드는 재현한 publish 경로만 덮었고, 같은 `_flush_pending()`에 닿는 나머지 경로는 "그 지점에 태스크를 세우지 못해 관측 가능한지조차 모른다"로 남겨 뒀다(#23). 이번에 세웠다 — `Client.flush()`는 PING을 transport에 직접 쓰므로 강제 flush는 타지 않지만, **flush 큐(기본 1024)가 차 있으면 `_flush_queue.put()`에서 멈추고** 거기 온 취소는 버려진다. 큐는 publish로는 차지 않고(빌 때만 넣는다) subscribe·unsubscribe·ping이 하나씩 채운다. nats-py 기본값 그대로 실제 서버에서 재현: flusher를 `drain()`에 세우고 `flush()` 1,023건으로 큐를 채운 뒤 `_mailbox()`를 부르자 `_send_ping → _flush_pending → Queue.put`에 섰고, 취소 뒤 `cancelled=False`로 **멀쩡한 mailbox를 돌려받았다**(`cancelling()` 0 → 1). 레이어가 호출자 태스크에서 직접 `flush()`를 부르는 자리는 셋 — 일반 채널 mailbox, 프로세스 구독 확인, 재접속 복원 — 이고 이제 전부 publish와 같은 가드를 지난다. 되살린 취소는 기존 정리 경로(`except BaseException`)를 타므로 만들다 만 구독은 해지된다. **subscribe·unsubscribe는 해당 없다** — 레이어가 자식 태스크 + shield로 감싸므로 호출자의 취소가 nats-py 안에 들어가지 않는다(코드상 확인) (#23)
+
 ## [0.7.2] - 2026-09-18
 
 ### Fixed

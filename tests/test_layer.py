@@ -1038,6 +1038,49 @@ async def test_a_cancellation_the_client_swallows_still_reaches_the_caller(layer
         client.publish = original
 
 
+@pytest.mark.parametrize("kind", ["plain", "process"])
+async def test_a_cancellation_the_client_swallows_in_flush_still_reaches_the_caller(layer, kind):
+    """The flush that confirms a new subscription can swallow a cancellation too.
+
+    ``Client.flush()`` reaches the same ``_flush_pending()`` as publish does, and
+    parks in ``_flush_queue.put()`` once the flusher is stuck and the queue is full
+    (reproduced against a real server with nats-py's defaults: the cancelled caller
+    was handed a working mailbox, ``cancelling()`` 0 -> 1). Unlike a subscribe, the
+    layer runs this flush on the caller's own task, so the caller is the one that
+    loses its cancellation.
+
+    As with publish, the flush here swallows by hand; what is pinned is that the
+    caller still ends cancelled and that nothing it was making is left behind.
+    """
+    client = await layer._client()
+    original, parked = client.flush, asyncio.Event()
+
+    async def swallowing_flush(*args, **kwargs):
+        parked.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # what _flush_pending does; no uncancel()
+
+    # Named by hand: new_channel() would already have subscribed the process subject.
+    channel = "jobs" if kind == "plain" else f"specific.{layer._state().client_id}!first"
+    client.flush = swallowing_flush
+    try:
+        opening = asyncio.create_task(layer._mailbox(channel))
+        await asyncio.wait_for(parked.wait(), 5)
+        assert opening.cancel(), "the mailbox should still have been opening"
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(opening, 5)
+    finally:
+        client.flush = original
+
+    state = layer._state()
+    assert channel not in state.mailboxes, "a mailbox nothing confirmed was handed out"
+    assert not state.process_subscriptions, "an unconfirmed process subscription was recorded"
+    assert all(sub._closed for sub in client._subs.values()), "the subscription was left on the connection"
+
+
 async def test_a_cancelled_subscribe_does_not_wait_out_a_jammed_connection(layer):
     """The cleanup for a cancelled subscribe must not block on the connection.
 
