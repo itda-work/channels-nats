@@ -564,15 +564,10 @@ class NatsChannelLayer(BaseChannelLayer):
             return await asyncio.shield(subscribing)
         except BaseException:
             try:
-                # shield again: a timeout here must not cancel the subscribe itself,
-                # or the handle goes back to being unreachable, which is #11.
-                leftover = await asyncio.wait_for(asyncio.shield(subscribing), CLEANUP_GRACE)
-            except asyncio.TimeoutError:
-                self._unsubscribe_later(subscribing)
+                if await self._within_grace(subscribing, later=self._unsubscribe_later):
+                    await self._unsubscribe([subscribing.result()])
             except Exception:
                 pass  # it never came up, so there is nothing to take down
-            else:
-                await self._unsubscribe([leftover])
             raise
 
     def _unsubscribe_later(self, subscribing: asyncio.Future) -> None:
@@ -589,6 +584,26 @@ class NatsChannelLayer(BaseChannelLayer):
             await self._unsubscribe([leftover])
 
         self._finish_later(asyncio.ensure_future(take_down()))
+
+    async def _within_grace(
+        self, work: asyncio.Future, later: t.Callable[[asyncio.Future], None] | None = None
+    ) -> bool:
+        """Wait for ``work`` no longer than ``CLEANUP_GRACE``; past that, hand it on.
+
+        This is the one shape every cleanup that talks to the server takes: the
+        command must run to its end (a subscription left half-made keeps
+        delivering, #11), but a caller that is tidying up -- often because it was
+        cancelled -- must not be held for as long as a jammed connection takes.
+        ``work`` is shielded, so the timeout never cancels the command itself.
+        Returns whether it finished here; when it did not, ``later`` (default
+        ``_finish_later``) owns it from now on.
+        """
+        try:
+            await asyncio.wait_for(asyncio.shield(work), CLEANUP_GRACE)
+        except asyncio.TimeoutError:
+            (later or self._finish_later)(work)
+            return False
+        return True
 
     def _finish_later(self, work: asyncio.Future | t.Coroutine[t.Any, t.Any, t.Any]) -> None:
         """Let a command the caller no longer waits for run to its end.
@@ -607,7 +622,15 @@ class NatsChannelLayer(BaseChannelLayer):
             task.cancel()
             return
         state.cleanups.add(task)
-        task.add_done_callback(state.cleanups.discard)
+
+        def done(finished: asyncio.Future) -> None:
+            state.cleanups.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                # Retrieved here so asyncio does not report it as never retrieved; a
+                # command that failed against a connection that is going is expected.
+                log.debug("channels_nats: a command left to finish later failed: %s", finished.exception())
+
+        task.add_done_callback(done)
 
     async def _flush_or_undo(self, client: Client, subscription: Subscription) -> None:
         """Wait for the server to have the subscription, or take it back down.
@@ -632,13 +655,8 @@ class NatsChannelLayer(BaseChannelLayer):
         past ``CLEANUP_GRACE`` the command is left to a background task.
         """
         for subscription in subscriptions:
-            dropping = asyncio.ensure_future(subscription.unsubscribe())
             try:
-                # shield: the timeout must not cancel the unsubscribe itself, or the
-                # subscription stays up and keeps taking messages from its queue group.
-                await asyncio.wait_for(asyncio.shield(dropping), CLEANUP_GRACE)
-            except asyncio.TimeoutError:
-                self._finish_later(dropping)
+                await self._within_grace(asyncio.ensure_future(subscription.unsubscribe()))
             except Exception as error:
                 log.debug("channels_nats: could not unsubscribe: %s", error)
 
