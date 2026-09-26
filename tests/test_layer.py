@@ -3,6 +3,7 @@ import contextlib
 import gc
 import logging
 import socket
+import threading
 import time
 
 import pytest
@@ -392,7 +393,11 @@ async def test_subscriptions_are_restored_after_the_client_is_closed(make_layer)
 
 
 def test_state_of_a_closed_loop_is_forgotten():
-    """A layer used from short-lived loops must not accumulate one state each."""
+    """A layer used from short-lived loops must not accumulate one state each.
+
+    The loop's own ``close()`` takes its state out (#31); before that, each new loop
+    swept its predecessors, and the newest stayed until the next one came.
+    """
     layer = NatsChannelLayer()
 
     async def touch() -> None:
@@ -405,7 +410,7 @@ def test_state_of_a_closed_loop_is_forgotten():
         finally:
             loop.close()
 
-    assert len(layer._states) == 1  # only the newest; its own successor will sweep it
+    assert len(layer._states) == 0
 
 
 async def test_flush_survives_a_connection_that_is_already_gone(make_layer):
@@ -433,6 +438,7 @@ async def test_flush_survives_a_connection_that_is_already_gone(make_layer):
 
 
 def test_close_also_forgets_other_closed_loops():
+    """The sweep for loops closed past the layer's ``close()`` (see #31)."""
     layer = NatsChannelLayer()
 
     async def touch() -> None:
@@ -443,7 +449,7 @@ def test_close_also_forgets_other_closed_loops():
         try:
             loop.run_until_complete(touch())
         finally:
-            loop.close()
+            type(loop).close(loop)
     assert len(layer._states) == 1  # the newest is still there, its loop now closed
 
     asyncio.run(layer.close())
@@ -1506,15 +1512,15 @@ async def test_a_group_subscription_goes_when_its_last_process_channel_leaves(la
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-def test_a_loop_that_closes_while_holding_a_connection_is_reported(nats_url, caplog):
-    """The layer cannot close that connection, so it has to say so.
+def test_a_loop_that_closes_bypassing_the_layer_is_still_reported(nats_url, caplog):
+    """The safety net under ``loop.close``: a loop the layer could not release.
 
-    Connections are per event loop. A loop that closes takes its own state with it
-    and the connection is left to the garbage collector -- measured: neither
-    ``writer.close()`` nor ``transport.abort()`` releases it once the loop is gone.
-    ``loop_state_warn_at`` does not catch this: those states are pruned, so the count
-    it watches stays low. Twenty ``async_to_sync`` calls left seventeen connections
-    open on the server and no warning at all.
+    The layer releases a loop's connection from inside that loop's ``close()`` (#31).
+    A loop closed some other way -- here by calling the class's ``close`` and so
+    stepping past the one the layer installed -- takes the connection with it, and
+    once the loop is gone neither ``writer.close()`` nor ``transport.abort()`` can
+    release it (measured). ``loop_state_warn_at`` does not catch this: those states
+    are pruned, so the count it watches stays low. So it is counted and reported.
     """
     layer = NatsChannelLayer(servers=nats_url)
     with caplog.at_level(logging.WARNING, logger="channels_nats"):
@@ -1523,7 +1529,7 @@ def test_a_loop_that_closes_while_holding_a_connection_is_reported(nats_url, cap
             try:
                 loop.run_until_complete(layer.group_send("room", {"type": "test.message"}))
             finally:
-                loop.close()
+                type(loop).close(loop)
         asyncio.run(layer.group_send("room", {"type": "test.message"}))  # notices them
         orphaned = layer._orphaned_connections
 
@@ -1538,6 +1544,131 @@ def test_a_loop_that_closes_while_holding_a_connection_is_reported(nats_url, cap
     # Both were counted; the warning is rate-limited like the other drop reports, so the
     # second is carried by the count rather than by a second line.
     assert orphaned == 2
+
+
+class _FakeNats:
+    """Just enough of a NATS server to count connections and to stop reading.
+
+    Runs in a thread of its own so that a test can drive the layer from sync code,
+    through ``async_to_sync``, the way a worker does. Portable on purpose: a wedged
+    broker is otherwise made with SIGSTOP, which Windows does not have.
+    """
+
+    INFO = b'INFO {"server_id":"fake","version":"2.10.0","proto":1,"headers":true,"max_payload":67108864}\r\n'
+
+    def __init__(self, *, stop_reading_after_handshake: bool = False) -> None:
+        self.stop_reading = stop_reading_after_handshake
+        self.open = 0
+        self.accepted = 0
+        self.ended: list[float] = []  # when each connection was seen to end
+        self.resume = threading.Event()
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._server = self._loop.run_until_complete(asyncio.start_server(self._serve, "127.0.0.1", 0))
+        self.port = self._server.sockets[0].getsockname()[1]
+        self._ready.set()
+        self._loop.run_forever()
+
+    async def _serve(self, reader, writer) -> None:
+        self.open += 1
+        self.accepted += 1
+        writer.write(self.INFO)
+        tail = b""  # a PING split across two reads is still answered
+        try:
+            while chunk := await reader.read(1 << 16):
+                data = tail + chunk
+                for _ in range(data.count(b"PING\r\n")):
+                    writer.write(b"PONG\r\n")
+                tail = data[-5:]
+                if self.stop_reading and b"PING\r\n" in data:
+                    # The handshake is answered; from here the broker is wedged.
+                    await asyncio.to_thread(self.resume.wait)
+                    while await reader.read(1 << 20):
+                        pass
+                    break
+        except ConnectionError:
+            pass
+        finally:
+            self.open -= 1
+            self.ended.append(time.monotonic())
+            writer.close()
+
+    def close(self) -> None:
+        self.resume.set()
+        self._loop.call_soon_threadsafe(self._server.close)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(5)
+
+
+def test_async_to_sync_does_not_leave_its_connection_behind():
+    """Each ``async_to_sync`` call opens a connection on a loop of its own; closing
+    that loop has to close the connection, not leave it to the garbage collector.
+
+    Measured before #31 with the collector off: 100 calls, 100 connections still
+    open on the server. The collector does bound the pile in a default process, but
+    only once it runs, and never under ``gc.disable()``.
+    """
+    server = _FakeNats()
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
+    gc.disable()
+    try:
+        for _ in range(20):
+            async_to_sync(layer.group_send)("room", {"type": "x"})
+        for _ in range(50):
+            if server.open == 0:
+                break
+            time.sleep(0.05)
+        assert server.accepted == 20
+        assert server.open == 0, f"{server.open} of 20 connections still open after their loops closed"
+        assert layer._orphaned_connections == 0
+    finally:
+        gc.enable()
+        server.close()
+
+
+def test_a_loop_closing_on_a_wedged_broker_still_releases_its_socket():
+    """The broker has stopped reading, so the connection cannot close cleanly.
+
+    nats-py's ``close()`` marks the client closed first and then waits for the write
+    buffer to drain, which it never will; given up at a deadline, the socket stays
+    open with the buffer still in it, and once the loop is closed nothing can drain
+    or close it (measured, #31). The layer has to cut it instead -- and in bounded
+    time, since this runs inside the caller's ``async_to_sync``.
+    """
+    server = _FakeNats(stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{server.port}",
+        # Room for 40 MB without publish itself waiting on a forced flush: it is
+        # the loop's close that meets the wedged broker, not the call.
+        connect_options={"pending_size": 64 * 1024 * 1024},
+    )
+
+    async def announce() -> None:
+        for _ in range(10):
+            await layer.group_send("room", {"type": "x", "body": b"x" * 4_000_000})
+
+    gc.disable()
+    try:
+        started = time.monotonic()
+        async_to_sync(announce)()
+        returned = time.monotonic()
+        assert returned - started < 10, f"async_to_sync took {returned - started:.1f}s to return"
+
+        server.resume.set()  # read again: a released socket now ends, a held one does not
+        for _ in range(100):
+            if server.ended:
+                break
+            time.sleep(0.05)
+        assert server.ended, "the socket of the closed loop is still open"
+    finally:
+        gc.enable()
+        server.close()
 
 
 async def test_flush_does_not_strand_a_receive_that_was_still_subscribing(layer):

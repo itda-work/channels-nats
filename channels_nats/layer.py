@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import types
 import typing as t
 import uuid
 from dataclasses import dataclass, field
@@ -234,8 +235,9 @@ class NatsChannelLayer(BaseChannelLayer):
         self.connect_deadline = connect_deadline
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
         self._warned_about_loops = False
-        #: Loops that closed while their connection was still open. Counted because
-        #: the layer cannot close it for them -- see ``_forget_closed_loops``.
+        #: Loops that closed while their connection was still open, since the layer
+        #: started. Only a loop that got past ``_release_on_close`` can do that, and
+        #: its connection cannot be closed any more -- see ``_forget_closed_loops``.
         self._orphaned_connections = 0
         self._orphan_warned_at: float | None = None
 
@@ -251,6 +253,7 @@ class NatsChannelLayer(BaseChannelLayer):
             # garbage collector would not do.
             self._forget_closed_loops()
             state = self._states[loop] = _LoopState()
+            self._release_on_close(loop, state)
             if len(self._states) > self.loop_state_warn_at and not self._warned_about_loops:
                 self._warned_about_loops = True
                 log.warning(
@@ -273,14 +276,81 @@ class NatsChannelLayer(BaseChannelLayer):
         """
         return self._states.get(asyncio.get_running_loop())
 
+    def _release_on_close(self, loop: asyncio.AbstractEventLoop, state: _LoopState) -> None:
+        """Close this loop's connection from inside the loop's own ``close()``.
+
+        A connection belongs to the loop that opened it, and once that loop is closed
+        nothing can release it (``_forget_closed_loops``). ``async_to_sync`` opens a
+        loop per call, so every call left one behind for the garbage collector -- a
+        hundred calls with the collector off, a hundred connections on the server
+        (#31). ``loop.close()`` is the last moment the loop can still run the close,
+        and ``asyncio.run()``, which asgiref uses, calls it after cancelling the
+        loop's tasks. channels_redis does the same.
+        """
+        original = loop.close
+
+        def close(running: asyncio.AbstractEventLoop) -> None:
+            if running.is_running():
+                return original()  # refuses; keep watching for the real close
+            running.close = original  # type: ignore[method-assign]
+            try:
+                if self._states.get(running) is state and not running.is_closed():
+                    # Out of the table before closing: nats-py answers a close with
+                    # closed_cb, and a state still listed would start recovering.
+                    del self._states[running]
+                    self._release(running, state)
+            finally:
+                original()  # whatever the release did, the loop closes
+
+        try:
+            loop.close = types.MethodType(close, loop)  # type: ignore[method-assign]
+        except (AttributeError, TypeError):
+            pass  # a loop that takes no attributes; _forget_closed_loops still reports it
+
+    def _release(self, loop: asyncio.AbstractEventLoop, state: _LoopState) -> None:
+        """Close a connection on a loop about to close, cutting it if it will not go.
+
+        A clean close drains what is still pending, and a wedged broker never lets
+        that finish. Waited out at a deadline, nats-py has already marked the client
+        closed and the socket is still open with the buffer in it (measured) -- and
+        after this, the loop that could drain it is gone. So the transport is cut
+        whatever the close managed. This runs inside the caller's ``async_to_sync``,
+        hence the deadline.
+        """
+        client = state.client
+        if client is None:
+            return
+        closing = loop.create_task(client.close())
+        try:
+            loop.run_until_complete(asyncio.wait({closing}, timeout=CLEANUP_GRACE))
+        except Exception as error:
+            log.debug("channels_nats: closing a connection before its loop closed: %s", error)
+        if not closing.done():
+            closing.cancel()
+        # nats-py's own transport has no abort; the asyncio one under it does.
+        # ``_io_writer`` is nats-py's (TCP and TLS alike); a websocket connection
+        # has none and is left to its close.
+        writer = getattr(getattr(client, "_transport", None), "_io_writer", None)
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            transport.abort()
+        try:
+            loop.run_until_complete(asyncio.sleep(0))  # lets the abort and the cancel land
+        except Exception:
+            pass
+        if closing.done() and not closing.cancelled():
+            closing.exception()  # retrieved, so it is not reported as never retrieved
+
     def _forget_closed_loops(self) -> None:
         """Drop the state of loops that have closed, and report what went with it.
 
-        The connection of a closed loop cannot be released from here: its transport
-        belongs to that loop, ``writer.close()`` raises "Event loop is closed" and
-        ``transport.abort()`` schedules work that will never run (both measured). So
-        it is held until the garbage collector takes the client, and the only useful
-        thing this can do is say how many there have been.
+        ``_release_on_close`` closes a loop's connection as the loop closes. A loop
+        that got past it -- closed through its class's ``close``, or one that takes
+        no attributes -- still leaves one, and that cannot be released from here: its
+        transport belongs to that loop, ``writer.close()`` raises "Event loop is
+        closed" and ``transport.abort()`` schedules work that will never run (both
+        measured). So it is held until the garbage collector takes the client, and
+        the only useful thing this can do is say how many there have been.
 
         ``loop_state_warn_at`` does not cover this. It watches how many states exist,
         and these are pruned right here -- a process that opens a loop per call keeps
@@ -297,11 +367,10 @@ class NatsChannelLayer(BaseChannelLayer):
             return
         self._orphan_warned_at = now
         log.warning(
-            "channels_nats: %d event loop(s) closed while still holding a NATS connection. "
+            "channels_nats: %d event loop(s) so far closed while still holding a NATS "
+            "connection, without going through the close() the layer installed on them. "
             "A connection belongs to the loop that opened it, so this one cannot be closed "
-            "from here -- it goes when the garbage collector takes it. Calling the layer "
-            "through async_to_sync does this once per call; keep a loop, or reach the layer "
-            "from async code.",
+            "from here -- it goes when the garbage collector takes it.",
             self._orphaned_connections,
         )
 
