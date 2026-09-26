@@ -2,6 +2,12 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
+## [Unreleased]
+
+### Added
+
+- **`connect_deadline`(기본 5초): 접속 하나에 쓰는 전체 시간의 상한.** nats-py는 최초 접속에도 재접속 정책(기본 60회 × 2초)을 적용해서, 브로커가 없으면 레이어 호출 하나가 **120초** 뒤에야 `NoServersError`를 냈다(실제로 재현). 워커가 `async_to_sync`로 결과를 알리는 소비처는 브로커가 죽은 동안 태스크마다 2분씩 잡혔다. nats-py 옵션으로는 막을 수 없었다 — `connect_timeout`은 시도 한 번의 상한이고, `allow_reconnect=False`와 `max_reconnect_attempts=0`은 최초 접속의 재시도를 멈추지 않는다(실측). 이제 `client.connect()` 전체를 이 값으로 자르고, 넘으면 nats-py가 서버를 다 쓴 뒤 내던 것과 같은 `NoServersError`를 낸다. 포기한 client는 기존 경로대로 닫히고 복구 루프를 시작하지 않는다(#27과 같은 경로, 테스트로 확인). 한 번 붙었던 연결의 재접속은 nats-py의 백그라운드 경로라 영향이 없다. `None`이면 예전처럼 nats-py에 맡긴다. **동작 변경이다:** 브로커가 늦게 뜨는 배치에서 5초 넘게 기다리던 호출은 이제 실패한다 (#32)
+
 ## [0.7.3] - 2026-09-18
 
 ### Fixed

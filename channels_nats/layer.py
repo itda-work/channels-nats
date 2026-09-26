@@ -69,7 +69,7 @@ from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
 from nats.aio.subscription import Subscription
-from nats.errors import SlowConsumerError
+from nats.errors import NoServersError, SlowConsumerError
 
 from . import serializers
 
@@ -212,6 +212,7 @@ class NatsChannelLayer(BaseChannelLayer):
         capacity: int = 100,
         channel_capacity: t.Any = None,
         connect_options: dict[str, t.Any] | None = None,
+        connect_deadline: float | None = 5.0,
     ) -> None:
         super().__init__(expiry=expiry, capacity=capacity, channel_capacity=channel_capacity)
         # BaseChannelLayer stores the raw dict, but get_capacity iterates compiled
@@ -222,6 +223,15 @@ class NatsChannelLayer(BaseChannelLayer):
         self.prefix = prefix
         self.group_expiry = group_expiry
         self.connect_options = dict(connect_options or {})
+        #: Seconds one connect may take in all, retries included. nats-py applies its
+        #: reconnect policy to the first connect as well -- by default 60 attempts
+        #: two seconds apart -- so with no broker a call waited two minutes to fail
+        #: (#32). Not a nats-py option: ``connect_timeout`` bounds one attempt, and
+        #: neither ``allow_reconnect=False`` nor ``max_reconnect_attempts=0`` stops
+        #: the retries (both measured). Reconnecting a connection that was once up
+        #: is nats-py's own, in the background, and this does not touch it. None
+        #: leaves the connect to nats-py alone.
+        self.connect_deadline = connect_deadline
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
         self._warned_about_loops = False
         #: Loops that closed while their connection was still open. Counted because
@@ -352,7 +362,16 @@ class NatsChannelLayer(BaseChannelLayer):
         # silent -- a wedged broker, or a load balancer with no backend).
         client = Client()
         try:
-            await client.connect(servers=self.servers, closed_cb=on_closed, error_cb=on_error, **options)
+            deadline = asyncio.timeout(self.connect_deadline)
+            try:
+                async with deadline:
+                    await client.connect(servers=self.servers, closed_cb=on_closed, error_cb=on_error, **options)
+            except TimeoutError:
+                if not deadline.expired():
+                    raise  # nats-py's own, not the deadline
+                # The same error nats-py raises once it runs out of servers, only
+                # sooner, so a caller that handled one handles this.
+                raise NoServersError() from None
         except BaseException:
             # Closed in a task of its own: doing it here would run under this call's
             # own cancellation, and nats-py's close takes that as a reason to return

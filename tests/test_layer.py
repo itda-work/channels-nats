@@ -2,12 +2,13 @@ import asyncio
 import contextlib
 import gc
 import logging
+import socket
 import time
 
 import pytest
 from asgiref.sync import async_to_sync
 from channels.exceptions import MessageTooLarge
-from nats.errors import FlushTimeoutError
+from nats.errors import FlushTimeoutError, NoServersError
 
 from channels_nats import ChannelLayerClosed, NatsChannelLayer
 from channels_nats.layer import _Mailbox
@@ -1293,6 +1294,73 @@ async def test_connects_that_time_out_do_not_pile_up_sockets():
     finally:
         await layer.close()
         for writer in list(peers.values()):
+            writer.close()
+        server.close()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(server.wait_closed(), 5)
+
+
+async def test_a_missing_broker_fails_the_call_within_the_connect_deadline():
+    """With no broker, a call has to fail in seconds, not in two minutes.
+
+    nats-py applies its reconnect policy to the first connect too: 60 attempts two
+    seconds apart, so a closed port took 120 s to raise ``NoServersError`` (#32). A
+    worker that announces a result through the layer then held its task for two
+    minutes per message while the broker was down. Default options on purpose --
+    that is what a deployment gets.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]  # closed again once the block ends
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{port}")
+    try:
+        started = time.monotonic()
+        with pytest.raises(NoServersError):
+            await asyncio.wait_for(layer.group_send("g", {"type": "x"}), 20)
+        assert time.monotonic() - started < 10
+    finally:
+        await layer.close()
+
+
+async def test_a_connect_past_its_deadline_leaves_nothing_behind():
+    """Giving up on a connect at the deadline releases its socket and starts nothing.
+
+    The server accepts and never sends INFO, and nats-py's own ``connect_timeout`` is
+    set well past the deadline, so it is the deadline that ends the call. The client
+    it gave up on must be closed like any connect that never came up (#27): no socket
+    left with the server, and no recovery loop connecting for a caller who has left.
+
+    The server here is a plain asyncio one; no nats-server is involved.
+    """
+    accepted: list = []
+    released: list = []
+
+    async def silent(reader, writer):
+        accepted.append(writer)
+        await reader.read(1)  # never send INFO; returns once the client lets go
+        released.append(writer)
+        writer.close()
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{port}",
+        connect_deadline=0.5,
+        connect_options={"connect_timeout": 30},
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(NoServersError):
+            await asyncio.wait_for(layer.new_channel(), 10)
+        assert time.monotonic() - started < 3
+
+        await asyncio.sleep(1.5)  # room for the close, and for a reconnect if one was started
+        assert layer._state().recovery is None, "giving up on a connect started the recovery loop"
+        assert len(accepted) == 1, f"{len(accepted) - 1} connection(s) opened after the deadline"
+        assert released, "the socket of the connect given up on is still held"
+    finally:
+        await layer.close()
+        for writer in accepted:
             writer.close()
         server.close()
         with contextlib.suppress(asyncio.TimeoutError):
