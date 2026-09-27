@@ -1625,9 +1625,18 @@ class _FakeNats:
 
     def close(self) -> None:
         self.resume.set()
-        self._loop.call_soon_threadsafe(self._server.close)
+
+        async def shut() -> None:
+            self._server.close()
+            # Waited for: a proactor loop stopped before its pending accept is
+            # cancelled reports that task destroyed at exit (seen on Windows).
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._server.wait_closed(), 5)
+
+        asyncio.run_coroutine_threadsafe(shut(), self._loop).result(10)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(5)
+        self._loop.close()
 
 
 def test_async_to_sync_does_not_leave_its_connection_behind():
