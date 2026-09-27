@@ -2,6 +2,12 @@
 
 Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기고 메이저(1.0 전에는 마이너)를 올린다.
 
+## [Unreleased]
+
+### Added
+
+- **`publish_deadline`(기본 10초): `send`/`group_send` 하나가 연결에 실리기를 기다리는 시간의 상한.** 보낼 것이 `pending_size`를 넘으면 nats-py는 publish를 flush가 끝날 때까지 세우고, 그 대기에는 상한이 없다(`flush_timeout` 기본 `None`). 브로커가 읽기를 멈추면 끝나지 않았다 — nats-py가 ping으로 멈춘 연결을 알아채 재접속으로 넘어간 뒤에도 기다리던 publish는 60초가 지나도 그대로였다(실제로 재현, ping 2초 설정). `flush_timeout`으로는 막을 수 없다: 대기는 끝나지만 `FlushTimeoutError`가 `error_cb`로만 가고 호출은 정상 반환한다(외부 검토에서 재현). 이제 레이어가 publish 하나를 이 값으로 자르고, 넘으면 호출자에게 `FlushTimeoutError`를 낸다. nats-py가 그 대기에 온 취소를 삼키므로, #23의 가드가 되살린 취소를 상한이 받아 판정한다. 메시지는 nats-py 버퍼에 남아 나중에 나갈 수도 있다. `None`이면 예전처럼 nats-py에 맡긴다. **동작 변경이다:** 멈춘 브로커에서 무기한 서 있던 호출은 이제 예외로 끝난다 (#33)
+
 ## [0.8.1] - 2026-09-27
 
 ### Fixed

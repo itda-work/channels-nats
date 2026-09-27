@@ -71,7 +71,7 @@ from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
 from nats.aio.subscription import Subscription
-from nats.errors import NoServersError, SlowConsumerError
+from nats.errors import FlushTimeoutError, NoServersError, SlowConsumerError
 
 from . import serializers
 
@@ -215,6 +215,7 @@ class NatsChannelLayer(BaseChannelLayer):
         channel_capacity: t.Any = None,
         connect_options: dict[str, t.Any] | None = None,
         connect_deadline: float | None = 5.0,
+        publish_deadline: float | None = 10.0,
     ) -> None:
         super().__init__(expiry=expiry, capacity=capacity, channel_capacity=channel_capacity)
         # BaseChannelLayer stores the raw dict, but get_capacity iterates compiled
@@ -234,6 +235,15 @@ class NatsChannelLayer(BaseChannelLayer):
         #: is nats-py's own, in the background, and this does not touch it. None
         #: leaves the connect to nats-py alone.
         self.connect_deadline = connect_deadline
+        #: Seconds one ``send``/``group_send`` may wait for the connection to take
+        #: it. Past ``pending_size`` nats-py makes a publish wait for a flush with no
+        #: timeout, and a broker that stops reading never lets it finish -- not even
+        #: after nats-py notices the connection is stale and reconnects (measured,
+        #: #33). nats-py's ``flush_timeout`` ends that wait but reports it only to
+        #: ``error_cb``: the publish returns as if it went out. Past this, the call
+        #: raises ``FlushTimeoutError`` instead. The message may still go out later
+        #: -- it is in nats-py's buffer -- or not. None leaves it to nats-py.
+        self.publish_deadline = publish_deadline
         self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
         self._warned_about_loops = False
         #: Loops that closed while their connection was still open, since the layer
@@ -789,7 +799,16 @@ class NatsChannelLayer(BaseChannelLayer):
                 f"message is {size} bytes on the wire, over the server's max_payload of "
                 f"{client.max_payload}; raise max_payload on nats-server or send less"
             )
-        await self._keeping_cancellation(client.publish(subject, payload, headers=headers))
+        deadline = asyncio.timeout(self.publish_deadline)
+        try:
+            async with deadline:
+                # The deadline cancels the wait; nats-py swallows that, and the guard
+                # puts it back so that the deadline can see its own cancellation.
+                await self._keeping_cancellation(client.publish(subject, payload, headers=headers))
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            raise FlushTimeoutError() from None
 
     async def _flush(self, client: Client) -> None:
         """``Client.flush()``, with a cancellation it swallowed put back."""

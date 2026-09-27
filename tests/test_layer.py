@@ -1604,18 +1604,18 @@ class _FakeNats:
         self.accepted += 1
         writer.write(self.INFO)
         tail = b""  # a PING split across two reads is still answered
+        wedge = self.stop_reading
         try:
             while chunk := await reader.read(1 << 16):
                 data = tail + chunk
                 for _ in range(data.count(b"PING\r\n")):
                     writer.write(b"PONG\r\n")
                 tail = data[-5:]
-                if self.stop_reading and b"PING\r\n" in data:
-                    # The handshake is answered; from here the broker is wedged.
+                if wedge and b"PING\r\n" in data:
+                    # The handshake is answered; from here the broker is wedged until
+                    # told to resume, and then it behaves again (PINGs answered).
+                    wedge = False
                     await asyncio.to_thread(self.resume.wait)
-                    while await reader.read(1 << 20):
-                        pass
-                    break
         except ConnectionError:
             pass
         finally:
@@ -1637,6 +1637,39 @@ class _FakeNats:
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(5)
         self._loop.close()
+
+
+async def test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline():
+    """A broker that stops reading must not hold ``send``/``group_send`` forever.
+
+    Past ``pending_size`` nats-py makes the publish wait for a flush with no timeout
+    (``flush_timeout`` defaults to None), and a wedged broker never lets it finish.
+    Not even nats-py's stale-connection detection frees it: with pings every 2 s it
+    went on to reconnect and the waiting publishes were still there a minute later
+    (measured, #33). Default options otherwise -- the deadline is what a deployment
+    gets. The broker reads again before the layer closes, so the close does not
+    wait out a drain.
+    """
+    server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
+    try:
+        body = b"x" * 1_000_000
+
+        async def publish() -> str:
+            try:
+                await layer.group_send("room", {"type": "x", "body": body})
+            except FlushTimeoutError:
+                return "timed out"
+            return "returned"
+
+        started = time.monotonic()
+        outcomes = await asyncio.wait_for(asyncio.gather(*(publish() for _ in range(8))), 30)
+        assert "timed out" in outcomes, outcomes  # some had to wait past pending_size
+        assert time.monotonic() - started < 20
+    finally:
+        server.resume.set()
+        await layer.close()
+        await asyncio.to_thread(server.close)
 
 
 def test_async_to_sync_does_not_leave_its_connection_behind():
