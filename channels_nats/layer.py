@@ -64,6 +64,7 @@ import time
 import types
 import typing as t
 import uuid
+import weakref
 from dataclasses import dataclass, field
 
 from channels.exceptions import ChannelFull, MessageTooLarge
@@ -288,17 +289,23 @@ class NatsChannelLayer(BaseChannelLayer):
         loop's tasks. channels_redis does the same.
         """
         original = loop.close
+        # Weakly: a loop closed past this wrapper keeps it, and a strong reference
+        # would keep the layer and the abandoned connection alive with the loop.
+        # While the loop is in use, ``_states`` holds the state anyway.
+        layer_ref, state_ref = weakref.ref(self), weakref.ref(state)
 
         def close(running: asyncio.AbstractEventLoop) -> None:
             if running.is_running():
                 return original()  # refuses; keep watching for the real close
             running.close = original  # type: ignore[method-assign]
+            layer, mine = layer_ref(), state_ref()
             try:
-                if self._states.get(running) is state and not running.is_closed():
-                    # Out of the table before closing: nats-py answers a close with
-                    # closed_cb, and a state still listed would start recovering.
-                    del self._states[running]
-                    self._release(running, state)
+                if layer is not None and mine is not None and layer._states.get(running) is mine:
+                    if not running.is_closed():
+                        # Out of the table before closing: nats-py answers a close with
+                        # closed_cb, and a state still listed would start recovering.
+                        del layer._states[running]
+                        layer._release(running, mine)
             finally:
                 original()  # whatever the release did, the loop closes
 

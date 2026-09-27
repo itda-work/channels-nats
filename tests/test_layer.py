@@ -5,6 +5,7 @@ import logging
 import socket
 import threading
 import time
+import weakref
 
 import pytest
 from asgiref.sync import async_to_sync
@@ -1544,6 +1545,29 @@ def test_a_loop_that_closes_bypassing_the_layer_is_still_reported(nats_url, capl
     # Both were counted; the warning is rate-limited like the other drop reports, so the
     # second is carried by the count rather than by a second line.
     assert orphaned == 2
+
+
+def test_a_loop_closed_past_the_layer_does_not_keep_the_layer_alive():
+    """The ``close()`` the layer installs stays on a loop closed some other way.
+
+    Holding the layer and the loop's state strongly, it kept both -- and the
+    abandoned connection -- alive for as long as the loop object lived, and their
+    tasks were reported destroyed at interpreter exit instead of where they leaked.
+    """
+    layer = NatsChannelLayer()
+
+    async def touch(layer: NatsChannelLayer) -> None:
+        layer._state()
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(touch(layer))
+    type(loop).close(loop)
+    alive = weakref.ref(layer)
+    del layer
+    gc.collect()
+
+    assert alive() is None, "a closed loop still holds the layer"
+    del loop
 
 
 class _FakeNats:
