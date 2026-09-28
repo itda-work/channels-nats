@@ -38,6 +38,12 @@ cp "$repo/scripts/ci-windows.ps1" "$PMLAB_SHARE_DIR/ci-windows.ps1"
 pmlab_switch >/dev/null
 pmlab_wait_ready >/dev/null
 trap 'pmlab_stop >/dev/null 2>&1 || true' EXIT
+# pmlab_wait_ready only sees exec succeed; right after a revert the share can
+# still be coming up, and a run started then leaves no log (seen once).
+for _ in $(seq 1 30); do
+  pmlab_exec cmd /c dir '\\Mac\parlab\src.zip' >/dev/null 2>&1 && break
+  sleep 2
+done
 
 status=0
 for cell in "cpython-3.13-windows-x86_64-none x64" "cpython-3.13-windows-aarch64-none arm64"; do
@@ -45,10 +51,12 @@ for cell in "cpython-3.13-windows-x86_64-none x64" "cpython-3.13-windows-aarch64
   echo "=== windows $tag"
   rm -f "$PMLAB_SHARE_DIR/test-$tag.log"
   # Positional: pmlab's wrapper passes arguments on as plain strings, not -Name value.
-  pmlab_runps ci-windows.ps1 "$python" "$tag" >/dev/null 2>&1 || true
+  said="$(pmlab_runps ci-windows.ps1 "$python" "$tag" 2>&1 || true)"
   log="$PMLAB_SHARE_DIR/test-$tag.log"
   if [ ! -f "$log" ]; then
-    echo "no log from the guest"; status=1; continue
+    echo "no log from the guest; it said:"
+    printf '%s\n' "$said" | LC_ALL=C tr -d '\r' | tail -20
+    status=1; continue
   fi
   # Everything but pytest's progress rows, so warnings printed after them show.
   LC_ALL=C tr -d '\r' <"$log" | grep -vE '^\.+ +\[ *[0-9]+%\]$' || true
