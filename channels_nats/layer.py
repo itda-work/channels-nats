@@ -669,7 +669,11 @@ class NatsChannelLayer(BaseChannelLayer):
         """
         subscribing = asyncio.ensure_future(client.subscribe(subject, queue=queue, cb=cb))
         try:
-            return await asyncio.shield(subscribing)
+            # Bounded as well: behind a full flush queue the subscribe does not
+            # return while the broker is wedged, and the layer fills that queue itself
+            # when many unsubscribes go out at once (#34). Past the deadline it is
+            # taken down in the background like a cancelled one.
+            return await self._within_deadline(asyncio.shield(subscribing))
         except BaseException:
             try:
                 if await self._within_grace(subscribing, later=self._unsubscribe_later):
@@ -799,20 +803,31 @@ class NatsChannelLayer(BaseChannelLayer):
                 f"message is {size} bytes on the wire, over the server's max_payload of "
                 f"{client.max_payload}; raise max_payload on nats-server or send less"
             )
+        await self._within_deadline(client.publish(subject, payload, headers=headers))
+
+    async def _flush(self, client: Client) -> None:
+        """``Client.flush()``, with a cancellation it swallowed put back, bounded."""
+        await self._within_deadline(client.flush())
+
+    async def _within_deadline[T](self, command: t.Awaitable[T]) -> T:
+        """Await a nats-py command for at most ``publish_deadline``.
+
+        A command waits for the connection to take it: a publish past
+        ``pending_size`` for a flush, and every command for room in nats-py's flush
+        queue. With the broker wedged neither wait ends (#33, #34). Past the deadline
+        this raises ``FlushTimeoutError``, the error nats-py itself reports for the
+        first. nats-py's own timeouts pass through unchanged.
+        """
         deadline = asyncio.timeout(self.publish_deadline)
         try:
             async with deadline:
                 # The deadline cancels the wait; nats-py swallows that, and the guard
                 # puts it back so that the deadline can see its own cancellation.
-                await self._keeping_cancellation(client.publish(subject, payload, headers=headers))
+                return await self._keeping_cancellation(command)
         except TimeoutError:
             if not deadline.expired():
                 raise
             raise FlushTimeoutError() from None
-
-    async def _flush(self, client: Client) -> None:
-        """``Client.flush()``, with a cancellation it swallowed put back."""
-        await self._keeping_cancellation(client.flush())
 
     async def _keeping_cancellation[T](self, command: t.Awaitable[T]) -> T:
         """Await a nats-py command; if it discarded our cancellation, raise it here.

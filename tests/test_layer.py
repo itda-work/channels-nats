@@ -1586,6 +1586,7 @@ class _FakeNats:
         self.accepted = 0
         self.ended: list[float] = []  # when each connection was seen to end
         self.resume = threading.Event()
+        self.wedged = threading.Event()  # set to stop reading at the next read, on demand
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1611,9 +1612,9 @@ class _FakeNats:
                 for _ in range(data.count(b"PING\r\n")):
                     writer.write(b"PONG\r\n")
                 tail = data[-5:]
-                if wedge and b"PING\r\n" in data:
-                    # The handshake is answered; from here the broker is wedged until
-                    # told to resume, and then it behaves again (PINGs answered).
+                if (wedge and b"PING\r\n" in data) or self.wedged.is_set():
+                    # From here the broker is wedged until told to resume, and then
+                    # it behaves again (PINGs answered).
                     wedge = False
                     await asyncio.to_thread(self.resume.wait)
         except ConnectionError:
@@ -1666,6 +1667,45 @@ async def test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline():
         outcomes = await asyncio.wait_for(asyncio.gather(*(publish() for _ in range(8))), 30)
         assert "timed out" in outcomes, outcomes  # some had to wait past pending_size
         assert time.monotonic() - started < 20
+    finally:
+        server.resume.set()
+        await layer.close()
+        await asyncio.to_thread(server.close)
+
+
+async def test_a_subscribe_behind_a_full_flush_queue_fails_at_the_deadline():
+    """Subscribing must not wait forever behind the layer's own unsubscribes.
+
+    Every nats-py command queues a flush, and the queue holds 1024. The layer
+    subscribes one at a time under ``subscribe_lock``, but it unsubscribes in the
+    background, many at once. With the broker wedged and the flusher stuck, 1,100
+    ``group_discard`` calls filled the queue, and a ``receive`` on a new channel then
+    waited in ``Client.subscribe()`` for as long as the broker stayed wedged -- still
+    there after 60 s (measured, #34). ``publish_deadline`` bounds it now.
+    """
+    server = await asyncio.to_thread(_FakeNats)
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{server.port}",
+        publish_deadline=1,
+        # Room to fill the socket without a publish meeting the deadline first.
+        connect_options={"pending_size": 64 * 1024 * 1024},
+    )
+    try:
+        channel = await layer.new_channel()
+        for group in range(1100):
+            await layer.group_add(f"g{group}", channel)
+        client = layer._state().client
+        server.wedged.set()
+        for _ in range(12):  # the flusher now sits in drain()
+            await layer.group_send("fill", {"type": "x", "body": b"x" * 1_000_000})
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*(layer.group_discard(f"g{group}", channel) for group in range(1100)))
+        assert client._flush_queue.full(), "the unsubscribes did not fill the flush queue"
+
+        started = time.monotonic()
+        with pytest.raises(FlushTimeoutError):
+            await asyncio.wait_for(layer.receive("after"), 30)
+        assert time.monotonic() - started < 10
     finally:
         server.resume.set()
         await layer.close()
