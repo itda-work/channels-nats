@@ -51,8 +51,15 @@ for cell in "cpython-3.13-windows-x86_64-none x64" "cpython-3.13-windows-aarch64
   echo "=== windows $tag"
   rm -f "$PMLAB_SHARE_DIR/test-$tag.log"
   # Positional: pmlab's wrapper passes arguments on as plain strings, not -Name value.
-  said="$(pmlab_runps ci-windows.ps1 "$python" "$tag" 2>&1 || true)"
   log="$PMLAB_SHARE_DIR/test-$tag.log"
+  # Right after a revert, prlctl exec itself has failed now and then
+  # ("PrlJob_GetRetCode: Invalid argument") without the guest running anything.
+  # That is the VM, not the tests: one more try.
+  for _ in 1 2; do
+    said="$(pmlab_runps ci-windows.ps1 "$python" "$tag" 2>&1 || true)"
+    [ -f "$log" ] && break
+    echo "(no log yet; prlctl said: $(printf '%s' "$said" | LC_ALL=C tr -d '\r' | tail -1); trying once more)"
+  done
   if [ ! -f "$log" ]; then
     echo "no log from the guest; it said:"
     printf '%s\n' "$said" | LC_ALL=C tr -d '\r' | tail -20
