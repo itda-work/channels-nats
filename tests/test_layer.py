@@ -1964,6 +1964,40 @@ async def test_close_on_a_wedged_broker_cuts_the_socket_and_says_what_it_dropped
         await asyncio.to_thread(server.close)
 
 
+async def test_a_close_cancelled_during_its_drain_does_not_leave_the_connection():
+    """``close()`` takes the loop's state first, so nothing else will close this one.
+
+    Cancelled while draining against a wedged broker, it left the client open, the
+    socket up and the server still holding the connection -- and the ``loop.close``
+    wrapper skips a state that is already gone (measured, #37). The cancellation is
+    still the caller's; the closing goes on in a task of its own.
+    """
+    server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
+    try:
+        await layer.group_send("room", {"type": "x"})
+        client = layer._state().client
+        closing = asyncio.create_task(layer.close())
+        await asyncio.sleep(0.5)
+        # Standing in the drain when cancelled, not already done (CLAUDE.md).
+        chain, coro = [], closing.get_coro()
+        while coro is not None:
+            chain.append(getattr(coro, "__qualname__", ""))
+            coro = getattr(coro, "cr_await", None)
+        assert not closing.done() and "Client.drain" in chain, chain
+        assert closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        writer = client._transport._io_writer
+        assert await asyncio.to_thread(_wait_for, lambda: writer.transport.is_closing(), 5), "still open"
+        server.resume.set()
+        assert await asyncio.to_thread(_wait_for, lambda: bool(server.ended), 5), "the server still holds it"
+    finally:
+        server.resume.set()
+        await asyncio.to_thread(server.close)
+
+
 async def test_flush_does_not_strand_a_receive_that_was_still_subscribing(layer):
     """``flush()`` while the channel's first ``receive()`` is still coming up.
 

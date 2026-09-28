@@ -257,6 +257,9 @@ class NatsChannelLayer(BaseChannelLayer):
         self._discarded_closes = 0
         self._discarded_bytes = 0
         self._discard_warned_at: float | None = None
+        #: Closes carried on after the caller of ``close()`` was cancelled. Held here
+        #: because the loop's state, which holds other leftover work, is already gone.
+        self._closing_behind: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ plumbing
 
@@ -1363,39 +1366,61 @@ class NatsChannelLayer(BaseChannelLayer):
             for box in state.mailboxes.values():
                 box.closed = True  # before the drain, so a slow one cannot hold them there
                 self._wake_receivers(box)
-        settling: list[asyncio.Future] = []
-        if state is not None:
-            for cleanup in list(state.cleanups):
-                cleanup.cancel()  # the connection is going; the subscriptions go with it
-                settling.append(cleanup)
-        if state is not None and state.recovery is not None:
-            state.recovery.cancel()
-            settling.append(state.recovery)
-        if settling:
-            # A cancelled task is not a finished one until the loop has run it. Under
-            # asyncio.run() the runner would collect them, but a loop that simply stops
-            # -- Twisted's, under daphne -- reports each as destroyed while pending.
-            # Bounded: a task that will not take its cancellation must not hold close().
-            try:
-                await asyncio.wait_for(asyncio.gather(*settling, return_exceptions=True), CLEANUP_GRACE)
-            except asyncio.TimeoutError:
-                log.debug("channels_nats: something did not take its cancellation before close returned")
-        if state is not None and state.client is not None and not state.client.is_closed:
-            client = state.client
-            try:
-                # Bounded like any other wait for the connection to take what is
-                # pending: nats-py's drain ends in a flush with a fixed 10 s of its
-                # own, so a wedged broker held close() that long at the least (#36).
-                await self._within_deadline(client.drain())
-            except Exception as error:
-                # A drain that failed says nothing yet about what went out: bytes the
-                # OS took still arrive once the broker reads (measured, #36). Close it
-                # the hard way -- tearing down must not become the caller's error --
-                # then cut whatever is still held, and report only that.
-                log.debug("channels_nats: could not drain the connection on close: %s", error)
-                closing = asyncio.ensure_future(client.close())
-                await asyncio.wait({closing}, timeout=CLEANUP_GRACE)
-                finished = self._finished(closing)
-                if not closing.done():
-                    closing.cancel()
-                self._report_close("closing the connection", finished, self._cut(client))
+        client = state.client if state is not None else None
+        try:
+            settling: list[asyncio.Future] = []
+            if state is not None:
+                for cleanup in list(state.cleanups):
+                    cleanup.cancel()  # the connection is going; the subscriptions go with it
+                    settling.append(cleanup)
+            if state is not None and state.recovery is not None:
+                state.recovery.cancel()
+                settling.append(state.recovery)
+            if settling:
+                # A cancelled task is not a finished one until the loop has run it. Under
+                # asyncio.run() the runner would collect them, but a loop that simply stops
+                # -- Twisted's, under daphne -- reports each as destroyed while pending.
+                # Bounded: a task that will not take its cancellation must not hold close().
+                try:
+                    await asyncio.wait_for(asyncio.gather(*settling, return_exceptions=True), CLEANUP_GRACE)
+                except asyncio.TimeoutError:
+                    log.debug("channels_nats: something did not take its cancellation before close returned")
+            if state is not None and state.client is not None and not state.client.is_closed:
+                client = state.client
+                try:
+                    # Bounded like any other wait for the connection to take what is
+                    # pending: nats-py's drain ends in a flush with a fixed 10 s of its
+                    # own, so a wedged broker held close() that long at the least (#36).
+                    await self._within_deadline(client.drain())
+                except Exception as error:
+                    # A drain that failed says nothing yet about what went out: bytes the
+                    # OS took still arrive once the broker reads (measured, #36). Close it
+                    # the hard way -- tearing down must not become the caller's error --
+                    # then cut whatever is still held, and report only that.
+                    log.debug("channels_nats: could not drain the connection on close: %s", error)
+                    await self._close_hard(client)
+        except asyncio.CancelledError:
+            # The state is gone already, so nothing else would ever close this
+            # connection -- the loop.close wrapper skips a state no longer listed
+            # (measured, #37). The cancellation stays the caller's; the closing goes
+            # on in a task of its own, since nats-py's close cut short by this very
+            # cancellation returns early and leaves the transport up (#27).
+            if client is not None and not client.is_closed:
+                behind = asyncio.ensure_future(self._close_hard(client))
+                self._closing_behind.add(behind)
+                behind.add_done_callback(self._closing_behind.discard)
+            raise
+
+    async def _close_hard(self, client: Client) -> None:
+        """Close a connection that would not drain: bounded, then cut, then say what
+        the cut lost. The cut happens even if this is cancelled while waiting."""
+        closing = asyncio.ensure_future(client.close())
+        closing.add_done_callback(lambda done: done.cancelled() or done.exception())  # retrieved
+        finished = False
+        try:
+            await asyncio.wait({closing}, timeout=CLEANUP_GRACE)
+            finished = self._finished(closing)
+        finally:
+            if not closing.done():
+                closing.cancel()
+            self._report_close("closing the connection", finished, self._cut(client))
