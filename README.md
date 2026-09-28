@@ -14,6 +14,23 @@ CHANNEL_LAYERS = {
 
 컨슈머, `group_send`, `get_channel_layer()` 등 Channels 코드는 그대로다. wireview처럼 채널 레이어 위에 올라간 라이브러리도 그대로다.
 
+## 위상: 기능 동결 + 유지보수 (2026-09-28 확정)
+
+새 기능은 더하지 않는다. 할 일은 네 가지다.
+
+- **결함 수정.** 무기한 멈춤을 유계 실패로 바꾸는 옵션(`connect_deadline`, `publish_deadline`)도 여기에 든다.
+- **의존성 호환 유지.** Python, Channels, nats-py의 새 판을 따라간다.
+- **문서를 실측에 맞추기.**
+- **릴리스.**
+
+아래 "왜"의 세 이유(Windows 네이티브, 발행 한 번의 fan-out, subject 계약)가 필요한 곳에 쓴다. **새 프로젝트이고 그런 이유가 없다면 `channels_redis`를 먼저 검토한다.** 순서 보장, 수신 측 단절 중의 보관, 운영 도구 면에서 그쪽이 낫다(아래 "Channels 규약과 다른 점"). 바꾸는 비용은 settings 한 줄과 브로커 운영이다.
+
+다음 가운데 하나가 생기면 동결을 다시 판단한다.
+
+- Windows 네이티브 배포가 실제로 생긴다.
+- NATS가 다른 이유로 인프라에 들어온다.
+- 페이로드 순서나 단절 중 보관이 제품 요구가 된다(#6).
+
 ## 왜
 
 - **Windows에서 WSL2·Docker 없이** 여러 Python 프로세스가 한 레이어를 공유한다. `nats-server.exe`를 PATH에 두면 끝.

@@ -25,6 +25,10 @@ scripts/ci-*.sh           로컬 CI. Linux는 docker, Windows는 Parallels 전�
 
 ## 규약
 
+- **이 저장소는 기능 동결 + 유지보수다**(2026-09-28 소유자 확정, README "위상").
+  - **하는 것:** 결함 수정, 의존성 호환, 문서를 실측에 맞추기, 릴리스
+  - **하지 않는 것:** 새 기능, 성능 작업, README가 내세우는 세 이유(Windows·fan-out·Go 합류)를 넓히는 작업, #6 단일 디스패처
+  - 새 기능 제안은 README의 재판단 계기 중 하나에 해당할 때만 연다. 그때도 channels_redis로 옮기는 안과 함께 비교한다.
 - 사용자 쪽 API를 늘리지 않는다. 옵션은 `CONFIG`로만.
 - subject 형식(`<prefix>.ch.<channel>`, `<prefix>.grp.<group>`)은 외부 계약이다. 바꾸면 README와 CHANGELOG에 남기고 메이저를 올린다.
 - Windows를 1급으로 지원한다. Unix 소켓, fork, 시그널에 의존하지 않는다. **검증 게이트는 로컬 CI다(`make -j2 ci-local`, 약 3분).** GitHub CI는 수동 실행 전용이다(Actions 사용 최소화). 로컬 CI의 칸은 넷이다.
