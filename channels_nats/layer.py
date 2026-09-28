@@ -251,6 +251,12 @@ class NatsChannelLayer(BaseChannelLayer):
         #: its connection cannot be closed any more -- see ``_forget_closed_loops``.
         self._orphaned_connections = 0
         self._orphan_warned_at: float | None = None
+        #: Closes that cut a connection with bytes still in the process's own buffers
+        #: (#35, #36). Kept on the layer: an ``async_to_sync`` loop's state goes with
+        #: each call, so an interval kept there would let every call warn.
+        self._discarded_closes = 0
+        self._discarded_bytes = 0
+        self._discard_warned_at: float | None = None
 
     # ------------------------------------------------------------------ plumbing
 
@@ -342,21 +348,72 @@ class NatsChannelLayer(BaseChannelLayer):
             loop.run_until_complete(asyncio.wait({closing}, timeout=CLEANUP_GRACE))
         except Exception as error:
             log.debug("channels_nats: closing a connection before its loop closed: %s", error)
+        finished = self._finished(closing)
         if not closing.done():
             closing.cancel()
-        # nats-py's own transport has no abort; the asyncio one under it does.
-        # ``_io_writer`` is nats-py's (TCP and TLS alike); a websocket connection
-        # has none and is left to its close.
-        writer = getattr(getattr(client, "_transport", None), "_io_writer", None)
-        transport = getattr(writer, "transport", None)
-        if transport is not None:
-            transport.abort()
+        backlog = self._cut(client)
         try:
             loop.run_until_complete(asyncio.sleep(0))  # lets the abort and the cancel land
         except Exception:
             pass
-        if closing.done() and not closing.cancelled():
-            closing.exception()  # retrieved, so it is not reported as never retrieved
+        self._report_close("closing the connection of a loop that was closing", finished, backlog)
+
+    @staticmethod
+    def _finished(closing: asyncio.Future) -> bool:
+        """Whether nats-py's close ran to the end. ``Client.is_closed`` cannot say:
+        nats-py sets it as the close begins."""
+        if not closing.done() or closing.cancelled():
+            return False
+        return closing.exception() is None  # also retrieves it, so it is not reported
+
+    @staticmethod
+    def _cut(client: Client) -> int:
+        """Abort the connection's transport; return what that threw away.
+
+        nats-py's own transport has no abort; the asyncio one under it does.
+        ``_io_writer`` is nats-py's (TCP and TLS alike); a websocket connection has
+        none and is left to its close. Measured just before the abort: sooner still
+        counts what would have gone out, later it is already zero. It is what the
+        process held -- nats-py's pending plus the transport's buffer -- not what a
+        receiver missed: bytes the OS already took can still arrive (measured, #35),
+        and a cut frame spoils bytes that did go out.
+        """
+        backlog = getattr(client, "_pending_data_size", 0) or 0
+        writer = getattr(getattr(client, "_transport", None), "_io_writer", None)
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            backlog += transport.get_write_buffer_size()
+            transport.abort()
+        return backlog
+
+    def _report_close(self, what: str, finished: bool, backlog: int) -> None:
+        """Say what a close that had to be cut lost, and only that.
+
+        Bytes left in the process's buffers are gone, and that is warned about -- on
+        the layer's interval, with the ones held back still counted. A close that
+        did not finish with nothing left behind (a ``closed_cb`` that never returns,
+        say) lost nothing that can be shown, so it is a debug line: calling it a loss
+        was the mistake #36 is about.
+        """
+        if not backlog:
+            if not finished:
+                log.debug("channels_nats: %s did not finish; nothing was left buffered", what)
+            return
+        self._discarded_closes += 1
+        self._discarded_bytes += backlog
+        now = time.monotonic()
+        if self._discard_warned_at is not None and now - self._discard_warned_at < self.drop_log_interval:
+            return
+        self._discard_warned_at = now
+        log.warning(
+            "channels_nats: %s, the connection had to be cut and %d bytes still buffered in this "
+            "process were discarded (%d such close(s) so far, %d bytes in all). What was sent "
+            "just before may not have reached the broker; what the OS had already taken still can.",
+            what,
+            backlog,
+            self._discarded_closes,
+            self._discarded_bytes,
+        )
 
     def _forget_closed_loops(self) -> None:
         """Drop the state of loops that have closed, and report what went with it.
@@ -1324,26 +1381,21 @@ class NatsChannelLayer(BaseChannelLayer):
             except asyncio.TimeoutError:
                 log.debug("channels_nats: something did not take its cancellation before close returned")
         if state is not None and state.client is not None and not state.client.is_closed:
+            client = state.client
             try:
-                await state.client.drain()
+                # Bounded like any other wait for the connection to take what is
+                # pending: nats-py's drain ends in a flush with a fixed 10 s of its
+                # own, so a wedged broker held close() that long at the least (#36).
+                await self._within_deadline(client.drain())
             except Exception as error:
-                # Draining flushes what is pending, so a connection that cannot reach
-                # the server does not drain -- nats-py runs out its own drain_timeout
-                # and flush_timeout and raises. Tearing down must not become an error
-                # for the caller, and the connection must not be left open either, so
-                # it goes the hard way. How long this takes is nats-py's drain
-                # semantics, not ours: measured on a wedged connection at about 50s
-                # with its defaults (30 + 10) and about 14s with both lowered to 2 and
-                # 1 through `connect_options`.
-                log.warning(
-                    "channels_nats: could not drain the connection on close (%s); closing it instead. "
-                    "Whatever was still pending did not go out.",
-                    error,
-                )
-                try:
-                    # Bounded too: closing writes what is left and waits for the socket,
-                    # which is the very thing that is stuck. Past the grace the caller
-                    # goes on and the connection dies with the loop.
-                    await asyncio.wait_for(state.client.close(), CLEANUP_GRACE)
-                except (Exception, asyncio.TimeoutError) as closing_error:
-                    log.debug("channels_nats: could not close the connection: %s", closing_error)
+                # A drain that failed says nothing yet about what went out: bytes the
+                # OS took still arrive once the broker reads (measured, #36). Close it
+                # the hard way -- tearing down must not become the caller's error --
+                # then cut whatever is still held, and report only that.
+                log.debug("channels_nats: could not drain the connection on close: %s", error)
+                closing = asyncio.ensure_future(client.close())
+                await asyncio.wait({closing}, timeout=CLEANUP_GRACE)
+                finished = self._finished(closing)
+                if not closing.done():
+                    closing.cancel()
+                self._report_close("closing the connection", finished, self._cut(client))

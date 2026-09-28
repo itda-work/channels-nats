@@ -1162,11 +1162,11 @@ async def test_a_cancelled_read_does_not_wait_out_a_jammed_unsubscribe(layer):
 async def test_close_survives_a_connection_that_cannot_be_drained(layer, caplog):
     """Draining flushes what is pending, so a jammed connection cannot be drained.
 
-    nats-py gives up after its own ``drain_timeout``/``flush_timeout`` and raises
-    ``FlushTimeoutError`` -- measured against a real server whose reader was stopped:
-    ``close()`` came back after 24 seconds with that exception, and after 12 with both
-    timeouts lowered. Tearing down must not become an error for the caller, so the
-    connection is closed the hard way instead.
+    Tearing down must not become an error for the caller, so the connection is
+    closed the hard way instead. Nothing was left buffered here, so nothing is
+    reported lost: the warning used to say "whatever was still pending did not go
+    out" whenever the drain failed, and a message it said that about arrived once
+    the broker read again (measured, #36).
     """
     client = await layer._client()
 
@@ -1178,7 +1178,7 @@ async def test_close_survives_a_connection_that_cannot_be_drained(layer, caplog)
         await layer.close()  # must not raise
 
     assert client.is_closed, "the connection has to go even when it cannot be drained"
-    assert any("could not drain" in record.message for record in caplog.records)
+    assert not any("discarded" in record.message for record in caplog.records), caplog.text
 
 
 async def test_handing_a_command_off_does_not_revive_a_closed_loop(layer):
@@ -1585,6 +1585,7 @@ class _FakeNats:
         self.open = 0
         self.accepted = 0
         self.ended: list[float] = []  # when each connection was seen to end
+        self.received = bytearray()  # every byte read, so a test can tell delivered from cut
         self.resume = threading.Event()
         self.wedged = threading.Event()  # set to stop reading at the next read, on demand
         self._loop = asyncio.new_event_loop()
@@ -1608,6 +1609,7 @@ class _FakeNats:
         wedge = self.stop_reading
         try:
             while chunk := await reader.read(1 << 16):
+                self.received += chunk
                 data = tail + chunk
                 for _ in range(data.count(b"PING\r\n")):
                     writer.write(b"PONG\r\n")
@@ -1738,7 +1740,7 @@ def test_async_to_sync_does_not_leave_its_connection_behind():
         server.close()
 
 
-def test_a_loop_closing_on_a_wedged_broker_still_releases_its_socket():
+def test_a_loop_closing_on_a_wedged_broker_still_releases_its_socket(caplog, monkeypatch):
     """The broker has stopped reading, so the connection cannot close cleanly.
 
     nats-py's ``close()`` marks the client closed first and then waits for the write
@@ -1759,12 +1761,18 @@ def test_a_loop_closing_on_a_wedged_broker_still_releases_its_socket():
         for _ in range(10):
             await layer.group_send("room", {"type": "x", "body": b"x" * 4_000_000})
 
+    cuts = _record_cuts(monkeypatch)
     gc.disable()
     try:
         started = time.monotonic()
-        async_to_sync(announce)()
+        with caplog.at_level(logging.WARNING, logger="channels_nats"):
+            async_to_sync(announce)()
         returned = time.monotonic()
         assert returned - started < 10, f"async_to_sync took {returned - started:.1f}s to return"
+        # Whatever the cut threw away has to be said, and nothing else (#35).
+        assert len(cuts) == 1
+        discarded = [r.message for r in caplog.records if "discarded" in r.message]
+        assert len(discarded) == (1 if cuts[0] else 0), (cuts, caplog.text)
 
         server.resume.set()  # read again: a released socket now ends, a held one does not
         for _ in range(100):
@@ -1772,9 +1780,188 @@ def test_a_loop_closing_on_a_wedged_broker_still_releases_its_socket():
                 break
             time.sleep(0.05)
         assert server.ended, "the socket of the closed loop is still open"
+        if cuts[0]:
+            assert len(server.received) < 40_000_000  # it really was cut, not delivered late
     finally:
         gc.enable()
         server.close()
+
+
+def _record_cuts(monkeypatch) -> list[int]:
+    """Record the backlog each cut measured, so a test can hold the layer to "warn
+    exactly when something was discarded" without assuming how much the OS takes.
+
+    How much of a large write stays in the process is the platform's business: on
+    macOS and Linux most of 40 MB waits in the transport, while Windows' proactor
+    hands it all to the OS in one overlapped send and holds nothing back (measured
+    in the local CI, #35).
+    """
+    cuts: list[int] = []
+    real = NatsChannelLayer._cut
+
+    def recording(client):
+        backlog = real(client)
+        cuts.append(backlog)
+        return backlog
+
+    monkeypatch.setattr(NatsChannelLayer, "_cut", staticmethod(recording))
+    return cuts
+
+
+def _wait_for(condition, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return condition()
+
+
+def test_a_small_message_to_a_wedged_broker_is_not_reported_lost(caplog):
+    """A message the OS already took is not lost, and must not be reported as lost.
+
+    The broker has stopped reading, yet a small publish returns at once and is on
+    the socket before the loop closes; once the broker reads again it arrives whole
+    (measured, #35). Only what is still in the process's own buffers when the
+    connection is cut is gone, and here there is none.
+    """
+    server = _FakeNats(stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
+    marker = b"small-and-delivered"
+    try:
+        with caplog.at_level(logging.DEBUG, logger="channels_nats"):
+            async_to_sync(layer.group_send)("room", {"type": "x", "body": marker})
+        server.resume.set()
+        assert _wait_for(lambda: marker in server.received), "the message never arrived"
+        assert not any("discarded" in r.message for r in caplog.records), caplog.text
+    finally:
+        server.close()
+
+
+def test_a_close_that_does_not_finish_with_nothing_buffered_is_not_reported_as_loss(caplog):
+    """A loop's close can run out of time with nothing left to send.
+
+    A ``closed_cb`` that never returns keeps nats-py's close from finishing, while
+    the broker has taken everything. That is a close that did not finish, not a
+    message lost -- a debug line, not a warning -- and the socket still goes.
+    """
+
+    async def never_returns() -> None:
+        await asyncio.sleep(3600)
+
+    server = _FakeNats()
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}", connect_options={"closed_cb": never_returns})
+    try:
+        with caplog.at_level(logging.DEBUG, logger="channels_nats"):
+            async_to_sync(layer.group_send)("room", {"type": "x"})
+        assert not any("discarded" in r.message for r in caplog.records), caplog.text
+        assert any("did not finish" in r.message for r in caplog.records), caplog.text
+        assert _wait_for(lambda: bool(server.ended)), "the socket was left open"
+    finally:
+        server.close()
+
+
+class _FakeTransport:
+    def __init__(self, buffered: int) -> None:
+        self.buffered = buffered
+        self.aborted = False
+
+    def get_write_buffer_size(self) -> int:
+        return self.buffered
+
+    def abort(self) -> None:
+        self.aborted = True
+        self.buffered = 0
+
+
+def _fake_client(pending: int, buffered: int):
+    transport = _FakeTransport(buffered)
+    writer = type("Writer", (), {"transport": transport})()
+    nats_transport = type("NatsTransport", (), {"_io_writer": writer})()
+    client = type("Client", (), {"_pending_data_size": pending, "_transport": nats_transport})()
+    return client, transport
+
+
+def test_a_cut_counts_both_buffers_and_aborts():
+    """What a cut throws away is nats-py's pending plus the socket's write buffer,
+    measured before the abort -- after it, the transport says zero."""
+    client, transport = _fake_client(pending=145, buffered=328_308)
+
+    assert NatsChannelLayer._cut(client) == 145 + 328_308
+    assert transport.aborted
+
+
+def test_discards_are_reported_once_per_interval_across_loops(caplog):
+    """Each ``async_to_sync`` call is a loop of its own, and its state goes with it.
+
+    So the interval between warnings is kept by the layer, not by the loop's state
+    -- otherwise every call would warn -- and the ones held back are still counted.
+    A close that did not finish with nothing left behind is not a loss at all.
+    """
+    layer = NatsChannelLayer()
+    with caplog.at_level(logging.DEBUG, logger="channels_nats"):
+        layer._report_close("closing", finished=False, backlog=100)
+        layer._report_close("closing", finished=False, backlog=200)
+        layer._report_close("closing", finished=False, backlog=0)
+
+    discarded = [r for r in caplog.records if "discarded" in r.message]
+    assert len(discarded) == 1 and discarded[0].levelno == logging.WARNING
+    assert (layer._discarded_closes, layer._discarded_bytes) == (2, 300)
+    assert any("did not finish" in r.message and r.levelno == logging.DEBUG for r in caplog.records)
+
+
+async def test_close_on_a_wedged_broker_does_not_call_a_delivered_message_lost(caplog):
+    """``close()`` used to say "did not go out" whenever the drain failed.
+
+    A small message the OS had already taken arrived whole once the broker read
+    again (measured, #36). The drain is bounded by ``publish_deadline`` now, and
+    nothing was left in the process's buffers, so nothing is reported lost.
+    """
+    server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}", publish_deadline=1)
+    marker = b"closed-but-delivered"
+    try:
+        await layer.group_send("room", {"type": "x", "body": marker})
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="channels_nats"):
+            await layer.close()
+        assert time.monotonic() - started < 5
+        assert not any("discarded" in r.message for r in caplog.records), caplog.text
+        server.resume.set()
+        assert await asyncio.to_thread(_wait_for, lambda: marker in server.received), "never arrived"
+    finally:
+        server.resume.set()
+        await asyncio.to_thread(server.close)
+
+
+async def test_close_on_a_wedged_broker_cuts_the_socket_and_says_what_it_dropped(caplog, monkeypatch):
+    """A failed drain left the socket open, 38 MB still in its buffer (measured, #36).
+
+    ``close()`` promises the connection is done with, so past its bounded close it
+    cuts the transport, as a closing loop does, and reports what that dropped.
+    """
+    server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
+    layer = NatsChannelLayer(
+        servers=f"nats://127.0.0.1:{server.port}",
+        publish_deadline=1,
+        connect_options={"pending_size": 64 * 1024 * 1024},
+    )
+    cuts = _record_cuts(monkeypatch)
+    try:
+        for _ in range(10):
+            await layer.group_send("room", {"type": "x", "body": b"x" * 4_000_000})
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="channels_nats"):
+            await layer.close()
+        assert time.monotonic() - started < 5
+        assert len(cuts) == 1
+        discarded = [r.message for r in caplog.records if "discarded" in r.message]
+        assert len(discarded) == (1 if cuts[0] else 0), (cuts, caplog.text)
+        server.resume.set()
+        assert await asyncio.to_thread(_wait_for, lambda: bool(server.ended)), "the socket is still open"
+    finally:
+        server.resume.set()
+        await asyncio.to_thread(server.close)
 
 
 async def test_flush_does_not_strand_a_receive_that_was_still_subscribing(layer):
