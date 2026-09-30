@@ -9,7 +9,7 @@
 # runner is amd64.
 set -euo pipefail
 
-NATS_VERSION="${NATS_VERSION:-v2.14.6}"
+NATS_VERSION="${NATS_VERSION:-v2.15.0}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 versions=("$@")
 [ ${#versions[@]} -gt 0 ] || versions=(3.13 3.14)

@@ -9,19 +9,22 @@
 #
 # The VM is win11-parlab-cnats, a clone kept for this repository and driven with
 # pmlab.sh from the windows-parallels-lab skill. Each run reverts it to the
-# snapshot cnats-tools, so nothing a run leaves behind reaches the next, and stops
+# snapshot cnats-tools-2150, so nothing a run leaves behind reaches the next, and stops
 # it afterwards. Set up once (2026-09-27):
 #   - cloned from the stopped lab clone win11-parlab (not from a master VM)
 #   - host-defined sharing off, one share: parlab -> ~/parlab-cnats
 #   - hostname WIN11-CNATS; snapshot cnats-base
 #   - C:\cnats: uv (aarch64), CPython 3.13 x64 and ARM64 via `uv python install`,
 #     nats-server v2.14.6 windows-arm64; snapshot cnats-tools
+#   - 2026-09-30: from cnats-tools, nats-server v2.15.0 windows-arm64 added beside
+#     v2.14.6 (still there; point NATS_SERVER in ci-windows.ps1 back to run on it);
+#     snapshot cnats-tools-2150. cnats-tools is kept to go back to.
 set -euo pipefail
 
 PMLAB_SH="${PMLAB_SH:-$HOME/Apps/itda-skills/hyve/skills/itda-dev/skills/windows-parallels-lab/scripts/pmlab.sh}"
 export PMLAB_VM="${PMLAB_VM:-win11-parlab-cnats}"
 export PMLAB_SHARE_DIR="${PMLAB_SHARE_DIR:-$HOME/parlab-cnats}"
-export PMLAB_SNAP="${PMLAB_SNAP:-cnats-tools}"
+export PMLAB_SNAP="${PMLAB_SNAP:-cnats-tools-2150}"
 export PMLAB_EXEC_TIMEOUT="${PMLAB_EXEC_TIMEOUT:-900}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 

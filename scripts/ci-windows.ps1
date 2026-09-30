@@ -12,7 +12,7 @@ $root = "C:\cnats"
 $out = "\\Mac\parlab\test-$Tag.log"
 $env:UV_PYTHON_INSTALL_DIR = "$root\python"
 $env:UV_PYTHON = $Python
-$env:NATS_SERVER = "$root\nats-server-v2.14.6-windows-arm64\nats-server.exe"
+$env:NATS_SERVER = "$root\nats-server-v2.15.0-windows-arm64\nats-server.exe"
 
 $src = "$root\src-$Tag"
 if (Test-Path $src) { Remove-Item -Recurse -Force $src }

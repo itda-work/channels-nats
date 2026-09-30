@@ -15,6 +15,7 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Changed
 
+- **nats-py 2.16.0, msgpack 1.2.3, nats-server v2.15.0에서 검증한다.** lock을 올렸고, 로컬 CI(Linux, Windows)와 GitHub CI의 nats-server를 v2.15.0으로 올렸다. Windows 칸은 서버가 VM 스냅샷에 들어 있어, v2.15.0을 더한 스냅샷 `cnats-tools-2150`을 새로 떴다(v2.14.6과 옛 스냅샷도 남아 있다). 레이어가 기대는 nats-py의 성질은 2.16에도 그대로다. `_flush_pending()`은 여전히 취소를 삼키므로 #23 가드는 계속 필요하고, `_pending_data_size`와 `_transport._io_writer`도 있다. 의존성 범위(`nats-py>=2.6,<3`)는 바꾸지 않았다 (#40)
 - **위상을 "기능 동결 + 유지보수"로 확정했다**(2026-09-28, 소유자). README에 "위상" 절을 두어 하는 일과 하지 않는 일, 새 프로젝트에서 channels_redis를 먼저 검토할 조건, 동결을 다시 판단할 계기를 적었다. 코드 변화는 없다.
 
 ## [0.9.3] - 2026-09-28

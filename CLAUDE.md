@@ -35,7 +35,7 @@ scripts/ci-*.sh           로컬 CI. Linux는 docker, Windows는 Parallels 전�
   - Linux(docker, 호스트 아키텍처 arm64)의 3.13·3.14: lint·pyright·테스트
   - Windows 11 ARM(Parallels 클론 `win11-parlab-cnats`)의 3.13 x64(에뮬레이션)·ARM64: 테스트만
 
-  하한이 3.13이므로 Windows도 하한을 돈다. lint·타입 검사는 플랫폼과 무관하다. 두 스크립트 모두 커밋 전 작업 트리(추적 파일과 무시되지 않은 새 파일)를 검증한다. Windows 칸은 매번 스냅샷 `cnats-tools`로 되돌리고 끝나면 VM을 끈다. VM 준비 내역과 pmlab.sh 의존은 `scripts/ci-windows.sh` 머리말에 있다. 남는 차이는 GitHub 러너의 amd64 Linux와 x64 네이티브 Windows다. 0.2.1의 클러스터 레이스는 Windows에서만 났으니, 타이밍이나 경로에 민감한 변경은 로컬 CI의 Windows 칸을 반드시 거친다.
+  하한이 3.13이므로 Windows도 하한을 돈다. lint·타입 검사는 플랫폼과 무관하다. 두 스크립트 모두 커밋 전 작업 트리(추적 파일과 무시되지 않은 새 파일)를 검증한다. Windows 칸은 매번 스냅샷 `cnats-tools-2150`(nats-server v2.15.0)으로 되돌리고 끝나면 VM을 끈다. VM 준비 내역과 pmlab.sh 의존은 `scripts/ci-windows.sh` 머리말에 있다. 남는 차이는 GitHub 러너의 amd64 Linux와 x64 네이티브 Windows다. 0.2.1의 클러스터 레이스는 Windows에서만 났으니, 타이밍이나 경로에 민감한 변경은 로컬 CI의 Windows 칸을 반드시 거친다.
 - 커밋 메시지는 영어 Conventional Commits. 문서는 한국어.
 - **작업 큐는 GitHub 이슈다.** 세션을 시작하면 `gh issue list`부터 본다. 결함을 발견하면 그 자리에서 고치거나 이슈로 남긴다 — 요약 말미의 "남은 것" 목록으로 넘기지 않는다. 이슈에는 재현 방법과 **검증 상태**(재현함 / 코드상 확인 / 미검증)를 적고, 심각도는 보수적으로 적는다.
 - **결함은 재현한 뒤에 말한다.** 코드를 읽고 추론한 것과 실제로 돌려 본 것을 구분해서 쓴다. 인터페이스 표면 비교(메서드가 다 있는지)로 "누락 없음"이라고 결론 내지 않는다 — 이 레이어의 실제 결함은 전부 동작에 있었다.
