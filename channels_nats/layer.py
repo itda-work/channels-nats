@@ -845,13 +845,14 @@ class NatsChannelLayer(BaseChannelLayer):
 
         nats-py only checks the payload, so a body just under the limit plus a
         header goes out, and the server answers by closing the connection --
-        taking every other channel on it down too.
+        taking every other channel on it down too. In bytes, as nats-py encodes
+        them: a channel name may carry Unicode past the ``!`` (#39).
         """
         if headers is None:
             return len(payload)
         overhead = len(b"NATS/1.0") + 2 + 2  # the version line and the blank line after the headers
         for key, value in headers.items():
-            overhead += len(key) + 2 + len(value) + 2  # "key: value\r\n"
+            overhead += len(key.encode()) + 2 + len(value.encode()) + 2  # "key: value\r\n"
         return len(payload) + overhead
 
     async def _publish(self, subject: str, message: Message, headers: dict[str, str] | None = None) -> None:

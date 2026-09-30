@@ -12,7 +12,7 @@ from asgiref.sync import async_to_sync
 from channels.exceptions import MessageTooLarge
 from nats.errors import FlushTimeoutError, NoServersError
 
-from channels_nats import ChannelLayerClosed, NatsChannelLayer
+from channels_nats import ChannelLayerClosed, NatsChannelLayer, serializers
 from channels_nats.layer import _Mailbox
 
 pytestmark = pytest.mark.integration
@@ -597,6 +597,30 @@ async def test_an_oversized_message_is_refused_without_killing_the_connection(ma
     assert not client.is_closed
     await worker.send(channel, {"type": "small"})
     assert await asyncio.wait_for(worker.receive(channel), 5) == {"type": "small"}
+
+
+async def test_a_header_is_weighed_in_bytes_not_characters(make_layer):
+    """nats-py sends headers as UTF-8, and Channels lets Unicode past the ``!`` (#39).
+
+    Counted in characters, a message 40 bytes over max_payload went out as one 40
+    under: ``send()`` returned, and the server hung up on the whole connection.
+    """
+    worker = make_layer()
+    channel = "specific.abc!" + "한" * 40  # 80 bytes more in UTF-8 than in characters
+    client = await worker._client()
+    header = len(b"NATS/1.0\r\n\r\n") + len(f"{worker.CHANNEL_HEADER}: {channel}\r\n".encode())
+
+    def message(size: int) -> dict:
+        return {"type": "big", "body": b"x" * size}
+
+    size = client.max_payload
+    size -= len(serializers.dumps(message(size))) + header - (client.max_payload + 40)
+    assert len(serializers.dumps(message(size))) + header == client.max_payload + 40
+
+    with pytest.raises(MessageTooLarge):
+        await worker.send(channel, message(size))
+    await asyncio.sleep(0.3)  # the server's answer, had it gone out
+    assert not client.is_closed and client.is_connected
 
 
 async def test_invalid_names_are_rejected(layer):

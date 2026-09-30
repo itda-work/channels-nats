@@ -4,6 +4,10 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ## [Unreleased]
 
+### Fixed
+
+- **헤더를 문자 수로 세어 `max_payload` 검사를 빠져나갔다.** nats-py는 헤더를 UTF-8로 보내고, Channels는 `!` 뒤에 유니코드 문자를 허용한다. `"한"`이 40자 든 채널 이름으로 `max_payload`보다 40바이트 큰 메시지를 보내면, 레이어는 40바이트 작다고 세어 내보냈다. 그러면 `send()`는 정상 반환하고, 서버는 `maximum payload violation`으로 연결을 끊었다(실제로 재현). 이제 바이트로 센다 (#39)
+
 ### Changed
 
 - **위상을 "기능 동결 + 유지보수"로 확정했다**(2026-09-28, 소유자). README에 "위상" 절을 두어 하는 일과 하지 않는 일, 새 프로젝트에서 channels_redis를 먼저 검토할 조건, 동결을 다시 판단할 계기를 적었다. 코드 변화는 없다.
