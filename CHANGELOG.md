@@ -6,6 +6,11 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 ### Fixed
 
+- **subject가 될 수 없는 이름이 연결까지 갔다.** Channels의 이름 규칙은 빈 조각이 있는 이름(`a..b`, `.a`, `a.`)과, 정규식의 `$` 때문에 끝에 개행 하나가 붙은 이름을 통과시킨다. 레이어는 그 이름을 그대로 subject에 넣었다.
+  - **nats-py 2.15:** 그런 이름으로 `receive`나 `group_add`를 하면 서버가 `-ERR 'Invalid Subject'`로 답했다. nats-py는 권한 오류가 아닌 모든 `-ERR`에 연결을 닫으므로, **그 루프의 모든 컨슈머가 수신을 잃었다**(실제로 재현: 정상 컨슈머가 약 11초 동안 80건 중 0건). 호출 자체는 10초 뒤 `FlushTimeoutError`로 끝났다. 끝에 개행이 붙은 이름으로 발행하면 서버가 연결을 끊었다.
+  - **nats-py 2.16:** subscribe는 `BadSubjectError`로 끝났다. 빈 조각이 있는 이름으로는 아무도 받지 못할 곳에 조용히 발행했다.
+
+  이제 `send`·`receive`·`group_*`·`new_channel`이 이름을 연결에 닿기 전에 `TypeError`로 거부한다. Channels가 잘못된 이름에 내는 것과 같은 예외다. 대상은 subject에 들어가는 부분뿐이다(일반 채널과 그룹은 전체, 프로세스 전용 채널은 `!` 앞). `!` 뒤는 헤더로만 가므로 개행만 막는다. `prefix`도 같은 규칙에 `*`·`>`까지 막고, 어기면 생성할 때 `ValueError`를 낸다. **동작 변경이다:** 이런 이름의 `send`/`group_send`는 조용히 사라지는 대신 예외를 낸다. 이 레이어로는 어차피 받을 수 없는 이름이다 (#38)
 - **헤더를 문자 수로 세어 `max_payload` 검사를 빠져나갔다.** nats-py는 헤더를 UTF-8로 보내고, Channels는 `!` 뒤에 유니코드 문자를 허용한다. `"한"`이 40자 든 채널 이름으로 `max_payload`보다 40바이트 큰 메시지를 보내면, 레이어는 40바이트 작다고 세어 내보냈다. 그러면 `send()`는 정상 반환하고, 서버는 `maximum payload violation`으로 연결을 끊었다(실제로 재현). 이제 바이트로 센다 (#39)
 
 ### Changed

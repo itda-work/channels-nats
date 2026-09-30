@@ -632,6 +632,53 @@ async def test_invalid_names_are_rejected(layer):
         await layer.send("ok", {"__asgi_channel__": "x"})
 
 
+@pytest.mark.parametrize("name", ["a..b", ".lead", "trail.", "line\n"])
+async def test_a_name_that_cannot_be_a_subject_is_refused_before_the_connection(make_layer, name):
+    """Channels' patterns let through empty tokens and, through ``$``, one trailing
+    newline, and neither can go into a subject (#38). Handed to nats-py 2.15, a
+    subscribe drew the server's -ERR and nats-py closed the loop's whole connection
+    -- every other consumer on it stopped receiving for about eleven seconds -- and a
+    publish with a newline made the server hang up. nats-py 2.16 refuses the
+    subscribe with its own error and publishes the empty tokens to nobody. Refused
+    here, the connection is never touched, whatever the nats-py version."""
+    layer = make_layer()
+    calls = {
+        "send": lambda: layer.send(name, {"type": "x"}),
+        "group_send": lambda: layer.group_send(name, {"type": "x"}),
+        "group_add (group)": lambda: layer.group_add(name, "fine"),
+        "group_add (channel)": lambda: layer.group_add("fine", name),
+        "group_discard": lambda: layer.group_discard(name, "fine"),
+        "receive": lambda: layer.receive(name),
+        "new_channel": lambda: layer.new_channel(name),
+    }
+    refused = []
+    for what, call in calls.items():
+        with contextlib.suppress(Exception):
+            try:
+                await asyncio.wait_for(call(), 3)
+            except TypeError:
+                refused.append(what)
+    assert refused == list(calls)
+    assert all(state.client is None for state in layer._states.values())  # no connection was opened
+
+
+def test_only_what_goes_into_a_subject_is_held_to_subject_rules():
+    """Past the ``!`` a name travels in a header, so dots there may be anything."""
+    layer = NatsChannelLayer()
+    assert layer.require_valid_channel_name("specific.abc!a..b.")
+    assert layer.require_valid_channel_name("specific.abc!")
+    with pytest.raises(TypeError):
+        layer.require_valid_channel_name("specific..abc!x")
+    with pytest.raises(TypeError):
+        layer.require_valid_channel_name("specific.abc!x\n")
+
+
+@pytest.mark.parametrize("prefix", ["", "app.", ".app", "a..b", "app.*", "app.>", "my app"])
+def test_a_prefix_that_cannot_start_a_subject_is_refused(prefix):
+    with pytest.raises(ValueError):
+        NatsChannelLayer(prefix=prefix)
+
+
 async def test_messages_carry_every_type_the_spec_allows(make_layer):
     """Byte strings are in the spec's list, and JSON cannot represent them."""
     worker = make_layer()

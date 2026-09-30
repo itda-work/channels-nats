@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import types
 import typing as t
@@ -86,6 +87,12 @@ Message = dict[str, t.Any]
 #: that long has stopped being a cancellation. The work still happens; what is
 #: bounded is how long the caller is held for it.
 CLEANUP_GRACE = 1.0
+
+#: What the part of a name that goes into a subject must look like: dot-separated
+#: tokens, none of them empty, without whitespace or wildcards. Channels' own patterns
+#: let through empty tokens ("a..b", ".a", "a.") and -- through ``$`` -- one trailing
+#: newline, and a subject can hold neither (#38).
+_SUBJECT_PART = re.compile(r"[^.\s*>]+(?:\.[^.\s*>]+)*")
 
 
 class ChannelLayerClosed(RuntimeError):
@@ -223,6 +230,11 @@ class NatsChannelLayer(BaseChannelLayer):
         # Channels annotates the attribute as the dict its own get_capacity cannot read.
         self.channel_capacity = self.compile_capacities(channel_capacity or {})  # type: ignore
         self.servers = [servers] if isinstance(servers, str) else list(servers)
+        if not isinstance(prefix, str) or not _SUBJECT_PART.fullmatch(prefix):
+            raise ValueError(
+                f"prefix {prefix!r} cannot start a NATS subject: it needs dot-separated parts, "
+                "none of them empty, without whitespace, '*' or '>'"
+            )
         self.prefix = prefix
         self.group_expiry = group_expiry
         self.connect_options = dict(connect_options or {})
@@ -645,6 +657,36 @@ class NatsChannelLayer(BaseChannelLayer):
         )
 
     CHANNEL_HEADER = "Channel"
+
+    def require_valid_channel_name(self, name: t.Any, receive: bool = False) -> bool:
+        """Channels' check, then what a subject needs on top of it (#38).
+
+        The name up to the ``!`` goes into a subject, and Channels lets through names
+        a subject cannot hold. Handed to nats-py, a subscribe on one drew the server's
+        -ERR and nats-py 2.15 closed the loop's whole connection over it -- every other
+        consumer on the loop stopped receiving -- and a trailing newline in a publish
+        made the server hang up (both measured). nats-py 2.16 refuses the subscribe
+        and publishes the empty tokens to nobody. Refused here, before any of that.
+        Past the ``!`` the name only travels in the ``Channel`` header, so only a
+        newline matters there.
+        """
+        super().require_valid_channel_name(name, receive)
+        if "\n" in name or not _SUBJECT_PART.fullmatch(name.partition("!")[0]):
+            raise TypeError(
+                f"Channel name {name!r} cannot be a NATS subject: the part before '!' needs "
+                "dot-separated parts, none of them empty, and the name no newline"
+            )
+        return True
+
+    def require_valid_group_name(self, name: t.Any) -> bool:
+        """Channels' check, then what a subject needs on top of it; see above."""
+        super().require_valid_group_name(name)
+        if not _SUBJECT_PART.fullmatch(name):
+            raise TypeError(
+                f"Group name {name!r} cannot be a NATS subject: it needs dot-separated parts, "
+                "none of them empty, and no newline"
+            )
+        return True
 
     def channel_subject(self, channel: str) -> str:
         """Subject a message for ``channel`` is published to."""
@@ -1222,6 +1264,7 @@ class NatsChannelLayer(BaseChannelLayer):
 
     async def new_channel(self, prefix: str = "specific") -> str:
         channel = f"{prefix}.{self._state().client_id}!{uuid.uuid4().hex}"
+        self.require_valid_channel_name(channel)  # the prefix is the caller's, and goes into a subject
         await self._mailbox(channel)  # subscribe now so nothing sent before the first receive() is lost
         return channel
 
