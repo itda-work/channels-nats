@@ -1,5 +1,7 @@
 # channels-nats
 
+> ⚠️ **실험적 프로젝트입니다 (Experimental).** itda-work 가 실험 목적으로 공개하는 라이브러리입니다. API·동작·지원 범위가 예고 없이 바뀔 수 있으니, 운영 환경에 쓸 때는 버전을 고정하고 CHANGELOG 를 확인하세요.
+
 > Django Channels 채널 레이어를 NATS 위에 올린다. Redis 대신 Go 단일 바이너리 하나. Windows, macOS, Linux 모두 네이티브.
 
 ```python

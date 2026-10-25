@@ -1,7 +1,7 @@
 [project]
 name = "channels-nats"
 version = "0.10.0"
-description = "NATS-backed channel layer for Django Channels: one Go binary instead of Redis, Windows-friendly"
+description = "[Experimental] NATS-backed channel layer for Django Channels: one Go binary instead of Redis, Windows-friendly"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
