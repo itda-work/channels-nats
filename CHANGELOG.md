@@ -8,6 +8,10 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 
 - README에 실험적 프로젝트임을 명시했다. API·동작·지원 범위가 예고 없이 바뀔 수 있으니 운영 환경에서는 버전을 고정한다.
 
+### Known Issues
+
+- **구독 확인이 취소되거나 시간 초과되면 그 루프의 연결이 수신을 멈춘다(nats-py 2.16.0).** 일반 채널의 첫 `receive`, 루프의 첫 `new_channel`, 루프에 처음 생기는 그룹의 `group_add`가 해당한다. 예외 없이 nats-py `ERROR` 한 줄만 남고, 기본값이면 재접속까지 최대 약 6분이 걸린다. 원인은 nats-py에 있고 상류 수정(nats-io/nats.py#1031)이 릴리스되면 하한을 올린다. 그때까지 README에 임시 안내를 두고, 이 결함을 strict xfail 회귀 테스트로 고정했다 (#41)
+
 ## [0.10.0] - 2026-09-30
 
 ### Fixed

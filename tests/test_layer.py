@@ -2214,3 +2214,72 @@ async def test_a_new_channel_that_flush_overtook_does_not_leave_its_subscription
     assert len(state.process_subscriptions) == 1
     await layer.send(channel, {"type": "test.message"})
     assert await asyncio.wait_for(layer.receive(channel), 5) == {"type": "test.message"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#41: nats-py 2.16.0 ends its read loop on the PONG of a cancelled flush. "
+    "Fixed upstream by nats-py#1031; once that is released, raise the nats-py floor and remove this mark.",
+)
+@pytest.mark.parametrize("kind", ["plain receive", "first new_channel", "first group_add"])
+async def test_a_cancelled_subscription_confirm_does_not_end_the_connection(make_layer, kind):
+    """A confirm cancelled while it waits for its PONG must not stop the connection reading.
+
+    ``Client.flush()`` puts a future on ``_pongs`` and waits for it. Cancelled, that
+    future stays on the list; when the PONG arrives, nats-py 2.16.0 calls
+    ``set_result()`` on it, gets ``InvalidStateError``, and its read loop breaks --
+    no reconnect, no close, one ERROR line. Every later confirm returns without the
+    server's answer, so the instance still looks healthy and receives nothing
+    (reproduced against a real server, #41). A short ``wait_for`` around a first
+    ``receive`` is one way to get there.
+
+    The cancel lands only once the confirm stands on a pending PONG, and that is
+    checked rather than assumed (see CLAUDE.md, 함정).
+    """
+    worker, sender = make_layer(), make_layer()
+    client = await worker._client()
+    if kind == "first group_add":
+        channel = await worker.new_channel()  # takes the loop's first new_channel confirm out of the way
+        confirming = worker.group_add("first-group", channel)
+    elif kind == "first new_channel":
+        confirming = worker.new_channel()
+    else:
+        confirming = worker.receive("plain-being-confirmed")
+
+    waiting = len(client._pongs)
+    task = asyncio.create_task(confirming)
+    for _ in range(10_000):
+        await asyncio.sleep(0)
+        if len(client._pongs) > waiting and not client._pongs[-1].done():
+            break
+    else:
+        pytest.fail("the confirm never waited on a PONG")
+    cancelled = client._pongs[-1]
+    chain, awaiting = [], task.get_coro()
+    while awaiting is not None:
+        chain.append(getattr(getattr(awaiting, "cr_code", None), "co_name", type(awaiting).__name__))
+        awaiting = getattr(awaiting, "cr_await", None)
+    if task.done() or "flush" not in chain or not task.cancel():
+        pytest.fail(f"the confirm was not standing on its flush: done={task.done()} chain={chain}")
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    # Let its PONG arrive before confirming anything else. A confirm queued behind it
+    # would otherwise lose its PONG to the dead read loop and end in FlushTimeoutError
+    # after publish_deadline -- the same defect, but not the failure this test pins.
+    for _ in range(500):
+        if all(future is not cancelled for future in client._pongs):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("the PONG of the cancelled confirm never arrived")
+
+    after = await worker.new_channel()
+    await worker.group_add("after", after)
+    await sender.send(after, {"type": "direct"})
+    await sender.group_send("after", {"type": "group"})
+    received = []
+    with contextlib.suppress(asyncio.TimeoutError):
+        for _ in range(2):
+            received.append((await asyncio.wait_for(worker.receive(after), 3))["type"])
+    assert sorted(received) == ["direct", "group"], f"the connection stopped reading after the cancel ({received})"
