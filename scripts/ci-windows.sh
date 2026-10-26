@@ -1,75 +1,76 @@
 #!/usr/bin/env bash
-# The Windows job of .github/workflows/ci.yml, run in a Parallels VM on this machine.
+# The Windows job of .github/workflows/ci.yml, run over SSH on a Windows machine.
 #
 #   scripts/ci-windows.sh
 #
-# Tests the working tree as git sees it (like scripts/ci-linux.sh) on Windows 11 ARM,
-# twice: x64 CPython 3.13 under emulation, the closest to GitHub's windows-latest,
-# and native ARM64 CPython 3.13, which no hosted runner covers.
+# Tests the working tree as git sees it (like scripts/ci-linux.sh) on native x64
+# Windows, twice: x64 CPython 3.13 (the floor) and 3.14, the same versions as Linux.
+# ARM64 Windows is not covered.
 #
-# The VM is win11-parlab-cnats, a clone kept for this repository and driven with
-# pmlab.sh from the windows-parallels-lab skill. Each run reverts it to the
-# snapshot cnats-tools-2150, so nothing a run leaves behind reaches the next, and stops
-# it afterwards. Set up once (2026-09-27):
-#   - cloned from the stopped lab clone win11-parlab (not from a master VM)
-#   - host-defined sharing off, one share: parlab -> ~/parlab-cnats
-#   - hostname WIN11-CNATS; snapshot cnats-base
-#   - C:\cnats: uv (aarch64), CPython 3.13 x64 and ARM64 via `uv python install`,
-#     nats-server v2.14.6 windows-arm64; snapshot cnats-tools
-#   - 2026-09-30: from cnats-tools, nats-server v2.15.0 windows-arm64 added beside
-#     v2.14.6 (still there; point NATS_SERVER in ci-windows.ps1 back to run on it);
-#     snapshot cnats-tools-2150. cnats-tools is kept to go back to.
+# The host is CI_WINDOWS_HOST, an ssh alias (default allieus-macbook-2017-win10:
+# Windows 10 22H2 AMD64, PowerShell 7 as the ssh shell, so remote commands are
+# PowerShell). The tools sit in %USERPROFILE%\cnats and nowhere else; PATH is left
+# alone. scripts/ci-windows-setup.ps1 puts them there (checked 2026-10-26):
+#   - uv\uv.exe 0.12.10 (x86_64-pc-windows-msvc), uv-cache\
+#   - nats-server-v2.15.0-windows-amd64\nats-server.exe
+#   - python\ (UV_PYTHON_INSTALL_DIR): CPython 3.13 and 3.14 x86_64
+#
+# Each run works in its own directory, %USERPROFILE%\cnats\run-<id>, and removes only
+# that directory at the end. Unlike a VM snapshot, nothing undoes what a run leaves
+# behind, so the run reports nats-server processes still alive afterwards. It does
+# not kill them: on a shared machine they may not be ours.
 set -euo pipefail
 
-PMLAB_SH="${PMLAB_SH:-$HOME/Apps/itda-skills/hyve/skills/itda-dev/skills/windows-parallels-lab/scripts/pmlab.sh}"
-export PMLAB_VM="${PMLAB_VM:-win11-parlab-cnats}"
-export PMLAB_SHARE_DIR="${PMLAB_SHARE_DIR:-$HOME/parlab-cnats}"
-export PMLAB_SNAP="${PMLAB_SNAP:-cnats-tools-2150}"
-export PMLAB_EXEC_TIMEOUT="${PMLAB_EXEC_TIMEOUT:-900}"
+host="${CI_WINDOWS_HOST:-allieus-macbook-2017-win10}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15)
+run_id="run-$(date +%Y%m%d-%H%M%S)-$$"
 
-[ -f "$PMLAB_SH" ] || { echo "ci-windows: pmlab.sh not found at $PMLAB_SH (set PMLAB_SH)" >&2; exit 2; }
-set +u  # pmlab.sh is not written for nounset
-# shellcheck source=/dev/null
-source "$PMLAB_SH"
+rsh() { ssh "${ssh_opts[@]}" "$host" "$@"; }
 
-zip_path="$(mktemp -d)/src.zip"
+if ! said="$(rsh 'Write-Output ok' 2>&1)"; then
+  echo "ci-windows: cannot reach $host over ssh (set CI_WINDOWS_HOST):" >&2
+  printf '%s\n' "$said" | LC_ALL=C tr -d '\r' | tail -5 >&2
+  exit 2
+fi
+
+local_dir="$(mktemp -d)"
+zip_path="$local_dir/src.zip"
 (cd "$repo" && git ls-files -z --cached --others --exclude-standard | xargs -0 zip -q "$zip_path")
-cp "$zip_path" "$PMLAB_SHARE_DIR/src.zip"
-cp "$repo/scripts/ci-windows.ps1" "$PMLAB_SHARE_DIR/ci-windows.ps1"
 
-pmlab_switch >/dev/null
-pmlab_wait_ready >/dev/null
-trap 'pmlab_stop >/dev/null 2>&1 || true' EXIT
-# pmlab_wait_ready only sees exec succeed; right after a revert the share can
-# still be coming up, and a run started then leaves no log (seen once).
-for _ in $(seq 1 30); do
-  pmlab_exec cmd /c dir '\\Mac\parlab\src.zip' >/dev/null 2>&1 && break
-  sleep 2
-done
+rsh "New-Item -ItemType Directory -Path \"\$env:USERPROFILE\\cnats\\$run_id\" | Out-Null"
+cleanup() {
+  # Only this run's directory, by name; the guard stops an empty path from
+  # turning into a removal of cnats itself.
+  rsh "\$d = Join-Path \$env:USERPROFILE 'cnats\\$run_id'
+if (-not '$run_id' -or -not (Test-Path -LiteralPath \$d)) { throw \"no run directory: \$d\" }
+Remove-Item -Recurse -Force -LiteralPath \$d" >/dev/null 2>&1 \
+    || echo "ci-windows: could not remove %USERPROFILE%\\cnats\\$run_id on $host" >&2
+}
+trap cleanup EXIT
+# scp paths are relative to the remote home directory.
+scp -q "${ssh_opts[@]}" "$zip_path" "$repo/scripts/ci-windows.ps1" "$host:cnats/$run_id/"
 
 status=0
-for cell in "cpython-3.13-windows-x86_64-none x64" "cpython-3.13-windows-aarch64-none arm64"; do
-  read -r python tag <<<"$cell"
+for python in 3.13 3.14; do
+  tag="x64-$python"
   echo "=== windows $tag"
-  rm -f "$PMLAB_SHARE_DIR/test-$tag.log"
-  # Positional: pmlab's wrapper passes arguments on as plain strings, not -Name value.
-  log="$PMLAB_SHARE_DIR/test-$tag.log"
-  # Right after a revert, prlctl exec itself has failed now and then
-  # ("PrlJob_GetRetCode: Invalid argument") without the guest running anything.
-  # That is the VM, not the tests: one more try.
-  for _ in 1 2; do
-    said="$(pmlab_runps ci-windows.ps1 "$python" "$tag" 2>&1 || true)"
-    [ -f "$log" ] && break
-    echo "(no log yet; prlctl said: $(printf '%s' "$said" | LC_ALL=C tr -d '\r' | tail -1); trying once more)"
-  done
-  if [ ! -f "$log" ]; then
-    echo "no log from the guest; it said:"
-    printf '%s\n' "$said" | LC_ALL=C tr -d '\r' | tail -20
+  log="$local_dir/test-$tag.log"
+  rsh "pwsh -NoProfile -NonInteractive -File \"\$env:USERPROFILE\\cnats\\$run_id\\ci-windows.ps1\" -Run $run_id -Python cpython-$python-windows-x86_64-none -Tag $tag" \
+    >/dev/null 2>&1 || true
+  if ! scp -q "${ssh_opts[@]}" "$host:cnats/$run_id/test-$tag.log" "$log" 2>/dev/null; then
+    echo "no log from $host"
     status=1; continue
   fi
   # Everything but pytest's progress rows, so warnings printed after them show.
   LC_ALL=C tr -d '\r' <"$log" | grep -vE '^\.+ +\[ *[0-9]+%\]$' || true
   LC_ALL=C tr -d '\r' <"$log" | grep -q '^exit=0$' || status=1
 done
+
+# Report, don't kill: a leftover here means a test did not stop its server.
+left="$(rsh "Get-Process nats-server -ErrorAction SilentlyContinue | Where-Object Path -like \"\$env:USERPROFILE\\cnats\\*\" | ForEach-Object { \"\$(\$_.Id) \$(\$_.Path)\" }" 2>/dev/null | LC_ALL=C tr -d '\r' || true)"
+if [ -n "$left" ]; then
+  echo "=== windows: nats-server still running after the run (not stopped):"
+  printf '%s\n' "$left"
+fi
 exit $status
