@@ -1,27 +1,31 @@
-# Runs the test suite inside the Windows lab VM. Driven by scripts/ci-windows.sh,
-# which puts this file and src.zip on the share (\\Mac\parlab) first.
+# Runs the test suite on the Windows CI machine. Driven by scripts/ci-windows.sh,
+# which copies this file and src.zip into %USERPROFILE%\cnats\<Run> first and
+# removes that directory afterwards.
 #
-# Runs as SYSTEM through `prlctl exec`. The tools live in C:\cnats, installed once
-# when the VM was set up (see scripts/ci-windows.sh).
+# Runs as the ssh user under PowerShell 7. The tools live in %USERPROFILE%\cnats
+# (see scripts/ci-windows-setup.ps1); PATH is not used for them.
 param(
+    [Parameter(Mandatory)][string]$Run,
     [string]$Python = "cpython-3.13-windows-x86_64-none",
-    [string]$Tag = "x64"
+    [string]$Tag = "x64-3.13"
 )
 $ErrorActionPreference = "Continue"
-$root = "C:\cnats"
-$out = "\\Mac\parlab\test-$Tag.log"
+$root = "$env:USERPROFILE\cnats"
+$work = "$root\$Run"
+$out = "$work\test-$Tag.log"
 $env:UV_PYTHON_INSTALL_DIR = "$root\python"
+$env:UV_CACHE_DIR = "$root\uv-cache"
 $env:UV_PYTHON = $Python
-$env:NATS_SERVER = "$root\nats-server-v2.15.0-windows-arm64\nats-server.exe"
+$env:NATS_SERVER = "$root\nats-server-v2.15.0-windows-amd64\nats-server.exe"
+$uv = "$root\uv\uv.exe"
 
-$src = "$root\src-$Tag"
-if (Test-Path $src) { Remove-Item -Recurse -Force $src }
-Expand-Archive -Force "\\Mac\parlab\src.zip" $src
+$src = "$work\src-$Tag"
+Expand-Archive -Force "$work\src.zip" $src
 Set-Location $src
 
-# Through cmd: PowerShell 5.1 turns a native command's stderr into errors.
-cmd /c "$root\uv\uv.exe sync -q --all-extras > $root\sync-$Tag.log 2>&1"
-cmd /c "$root\uv\uv.exe run python -c ""import sys; print(sys.version)"" > $out 2>&1"
-cmd /c "$root\uv\uv.exe run pytest -o addopts= -q -p no:cacheprovider >> $out 2>&1"
+# PowerShell 7 writes a native command's redirected stderr as plain text, so no cmd.
+& $uv sync -q --all-extras *> "$work\sync-$Tag.log"
+& $uv run python -c "import platform, sys; print(sys.version, platform.machine())" *> $out
+& $uv run pytest -o addopts= -q -p no:cacheprovider *>> $out
 "exit=$LASTEXITCODE" | Out-File $out -Append -Encoding ascii
-Get-Content "$root\sync-$Tag.log" | Out-File $out -Append -Encoding utf8
+Get-Content "$work\sync-$Tag.log" | Out-File $out -Append -Encoding utf8
