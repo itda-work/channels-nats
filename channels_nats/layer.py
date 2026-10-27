@@ -59,6 +59,7 @@ second subscription on the same process subject and deliver every message twice.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import socket
@@ -95,6 +96,29 @@ CLEANUP_GRACE = 1.0
 #: let through empty tokens ("a..b", ".a", "a.") and -- through ``$`` -- one trailing
 #: newline, and a subject can hold neither (#38).
 _SUBJECT_PART = re.compile(r"[^.\s*>]+(?:\.[^.\s*>]+)*")
+
+#: The nats-py internals found missing so far, each warned about once per process.
+_missing_internals: set[str] = set()
+
+
+def _missing_internal(owner: object, name: str, lost: str) -> bool:
+    """Whether nats-py's ``owner`` no longer has ``name``; the first time, say what that turns off.
+
+    The layer reaches into nats-py in a few places, each with a fallback that keeps
+    it working without the feature. Without a word that fallback would hide the
+    feature going away under a nats-py release this layer was never run against
+    (#51); ``tests/test_nats_internals.py`` checks the same names on the lock's.
+    """
+    if hasattr(owner, name):
+        return False
+    _changed_internal(f"{type(owner).__name__}.{name} is gone", lost)
+    return True
+
+
+def _changed_internal(what: str, lost: str) -> None:
+    if what not in _missing_internals:
+        _missing_internals.add(what)
+        log.warning("channels_nats: nats-py's %s, so %s (#51)", what, lost)
 
 
 class ChannelLayerClosed(RuntimeError):
@@ -398,8 +422,12 @@ class NatsChannelLayer(BaseChannelLayer):
         receiver missed: bytes the OS already took can still arrive (measured, #35),
         and a cut frame spoils bytes that did go out.
         """
-        backlog = getattr(client, "_pending_data_size", 0) or 0
-        writer = getattr(getattr(client, "_transport", None), "_io_writer", None)
+        backlog = client.pending_data_size
+        lost = "a close that has to be cut leaves the socket to nats-py's own close"
+        nats_transport = None if _missing_internal(client, "_transport", lost) else client._transport
+        if isinstance(nats_transport, TcpTransport):
+            _missing_internal(nats_transport, "_io_writer", lost)
+        writer = getattr(nats_transport, "_io_writer", None)
         transport = getattr(writer, "transport", None)
         if transport is not None:
             backlog += transport.get_write_buffer_size()
@@ -563,11 +591,19 @@ class NatsChannelLayer(BaseChannelLayer):
         the option goes on each new socket there, before the reconnect writes.
         """
         proactor = getattr(asyncio, "ProactorEventLoop", None)
-        transport = getattr(client, "_transport", None)
         if proactor is None or not isinstance(asyncio.get_running_loop(), proactor):
             return
+        lost = "sends to a wedged broker are not bounded by publish_deadline (#47)"
+        if _missing_internal(client, "_transport", lost):
+            return
+        transport = client._transport
         if not isinstance(transport, TcpTransport):
             return  # websocket: no socket of its own to set
+        if _missing_internal(transport, "_io_writer", lost):
+            return
+        if not inspect.iscoroutinefunction(transport.connect):
+            _changed_internal("TcpTransport.connect is no longer a coroutine function", lost)
+            return
 
         def unbuffer() -> None:
             writer = transport._io_writer

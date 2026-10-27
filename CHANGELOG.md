@@ -7,6 +7,7 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 ### Changed
 
 - README에 실험적 프로젝트임을 명시했다. API·동작·지원 범위가 예고 없이 바뀔 수 있으니 운영 환경에서는 버전을 고정한다.
+- **레이어가 기대는 nats-py 내부가 사라지면 이제 WARNING 한 줄을 남긴다.** 끊어야 하는 close가 소켓을 abort하는 일(`_cut`)과 Windows proactor 루프의 `SO_SNDBUF=0`(#47)은 nats-py의 `Client._transport`, `TcpTransport._io_writer`, `TcpTransport.connect`에 기댄다. 이 이름이 없는 nats-py에서는 지금처럼 그 기능만 끄고 계속 동작하되, 무엇이 사라져 어떤 기능이 꺼졌는지를 `channels_nats` 로거에 프로세스당 한 번 경고한다. 전에는 아무 말 없이 꺼졌다. nats-py를 올릴 때 이 이름과 형태를 실제 연결로 확인하는 테스트를 더했다. 백로그 크기는 private `_pending_data_size` 대신 공개 `pending_data_size`로 읽는다 (#51)
 
 ### Fixed
 
