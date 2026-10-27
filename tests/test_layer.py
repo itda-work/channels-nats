@@ -3,7 +3,6 @@ import contextlib
 import gc
 import logging
 import socket
-import sys
 import threading
 import time
 import weakref
@@ -1739,20 +1738,12 @@ async def test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline():
     went on to reconnect and the waiting publishes were still there a minute later
     (measured, #33). Default options otherwise -- the deadline is what a deployment
     gets. The broker reads again before the layer closes, so the close does not
-    wait out a drain.
+    wait out a drain. On Windows' proactor loop the publishes wait at all only
+    because the layer sets ``SO_SNDBUF`` to 0; without it all 8 returned (#44, #47).
     """
     server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
     layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
     try:
-        if sys.platform == "win32":
-            # On the proactor loop Windows takes an overlapped send of any size into
-            # the kernel while SO_SNDBUF is not 0: 256 x 1 MB to this broker all
-            # returned within half a second, and arrived once it read again, so
-            # nothing ever waited (measured, #44). With 0 a send waits for TCP to
-            # take it, and the buffers fill at a few MB as they do on Linux and macOS.
-            client = await layer._client()
-            sock = client._transport._io_writer.get_extra_info("socket")
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 0)
         body = b"x" * 1_000_000
 
         async def publish() -> str:
@@ -1770,6 +1761,34 @@ async def test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline():
         server.resume.set()
         await layer.close()
         await asyncio.to_thread(server.close)
+
+
+async def test_the_send_buffer_is_zero_on_the_proactor_loop_and_left_alone_elsewhere(layer):
+    """Only the proactor loop gets ``SO_SNDBUF=0``, and it keeps it across a reconnect.
+
+    nats-py reconnects on the transport it already has, so a socket set once at
+    connect would be replaced by one with the default buffer -- and a broker that
+    wedges is one that may well have just come back.
+    """
+    proactor = getattr(asyncio, "ProactorEventLoop", ())
+    on_proactor = isinstance(asyncio.get_running_loop(), proactor)
+
+    def send_buffer(client) -> int:
+        return client._transport._io_writer.get_extra_info("socket").getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+
+    client = await layer._client()
+    first = send_buffer(client)
+    assert (first == 0) == on_proactor, first
+
+    reconnects = client.stats["reconnects"]
+    client._transport._io_writer.transport.abort()  # nats-py's own reconnect, not a new client
+    for _ in range(100):
+        await asyncio.sleep(0.1)
+        if client.stats["reconnects"] > reconnects and client.is_connected:
+            break
+    assert client.stats["reconnects"] > reconnects, "no reconnect"
+    assert await layer._client() is client
+    assert (send_buffer(client) == 0) == on_proactor
 
 
 async def test_a_subscribe_behind_a_full_flush_queue_fails_at_the_deadline():

@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
 import types
 import typing as t
@@ -72,6 +73,7 @@ from channels.exceptions import ChannelFull, MessageTooLarge
 from channels.layers import BaseChannelLayer
 from nats.aio.client import Client
 from nats.aio.subscription import Subscription
+from nats.aio.transport import TcpTransport
 from nats.errors import FlushTimeoutError, NoServersError, SlowConsumerError
 
 from . import _nats_patches, serializers
@@ -541,7 +543,50 @@ class NatsChannelLayer(BaseChannelLayer):
             self._finish_later(self._close_quietly(client))
             raise
         came_up = True
+        self._bound_kernel_sends(client)
         return client
+
+    @staticmethod
+    def _bound_kernel_sends(client: Client) -> None:
+        """On the proactor loop, give the connection's socket ``SO_SNDBUF=0``.
+
+        There, Windows takes an overlapped send of any size into kernel memory
+        while ``SO_SNDBUF`` is not 0. To a suspended nats-server, two rounds of 256
+        concurrent 1 MB ``group_send`` calls returned in 0.5 s each and the nonpaged
+        pool grew by 489 MB; nothing waited, so ``publish_deadline`` had nothing to
+        bound until a third round (measured, #47). With 0 a send completes once TCP has taken it, the
+        backlog stays in nats-py and the transport as on Linux, and the same burst
+        failed at the deadline. On a healthy broker it measured the same either
+        way. The selector loop, and every other platform, are left alone.
+
+        nats-py keeps one transport across reconnects and connects it again, so
+        the option goes on each new socket there, before the reconnect writes.
+        """
+        proactor = getattr(asyncio, "ProactorEventLoop", None)
+        transport = getattr(client, "_transport", None)
+        if proactor is None or not isinstance(asyncio.get_running_loop(), proactor):
+            return
+        if not isinstance(transport, TcpTransport):
+            return  # websocket: no socket of its own to set
+
+        def unbuffer() -> None:
+            writer = transport._io_writer
+            sock = writer.get_extra_info("socket") if writer is not None else None
+            if sock is None:
+                return
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 0)
+            except OSError as error:
+                log.warning("channels_nats: could not set SO_SNDBUF to 0, sends are not bounded: %s", error)
+
+        connect = transport.connect
+
+        async def connect_unbuffered(*args: t.Any, **kwargs: t.Any) -> None:
+            await connect(*args, **kwargs)
+            unbuffer()
+
+        transport.connect = connect_unbuffered  # type: ignore[method-assign]
+        unbuffer()
 
     async def _close_quietly(self, client: Client) -> None:
         """Close a connection nobody received, without making that anyone's problem."""
