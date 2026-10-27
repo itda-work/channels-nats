@@ -1994,7 +1994,7 @@ def _fake_client(pending: int, buffered: int):
     transport = _FakeTransport(buffered)
     writer = type("Writer", (), {"transport": transport})()
     nats_transport = type("NatsTransport", (), {"_io_writer": writer})()
-    client = type("Client", (), {"_pending_data_size": pending, "_transport": nats_transport})()
+    client = type("Client", (), {"pending_data_size": pending, "_transport": nats_transport})()
     return client, transport
 
 
