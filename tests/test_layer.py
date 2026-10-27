@@ -3,6 +3,7 @@ import contextlib
 import gc
 import logging
 import socket
+import sys
 import threading
 import time
 import weakref
@@ -1727,6 +1728,15 @@ async def test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline():
     server = await asyncio.to_thread(_FakeNats, stop_reading_after_handshake=True)
     layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}")
     try:
+        if sys.platform == "win32":
+            # On the proactor loop Windows takes an overlapped send of any size into
+            # the kernel while SO_SNDBUF is not 0: 256 x 1 MB to this broker all
+            # returned within half a second, and arrived once it read again, so
+            # nothing ever waited (measured, #44). With 0 a send waits for TCP to
+            # take it, and the buffers fill at a few MB as they do on Linux and macOS.
+            client = await layer._client()
+            sock = client._transport._io_writer.get_extra_info("socket")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 0)
         body = b"x" * 1_000_000
 
         async def publish() -> str:
