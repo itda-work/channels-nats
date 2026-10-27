@@ -11,10 +11,7 @@ Keep a Changelog 형식. subject 규약이 바뀌면 여기와 README에 남기�
 ### Fixed
 
 - **`test_a_publish_stuck_on_a_wedged_broker_fails_at_the_deadline`가 x64 Windows에서 실패했다.** 레이어 결함이 아니라 테스트의 가정이 맞지 않았다. Windows의 proactor 루프에서는 `SO_SNDBUF`가 0이 아니면 커널이 보낸 것을 크기와 상관없이 받아 두므로(1 MB × 256까지 즉시 반환, 브로커가 다시 읽자 전부 도착), publish가 기다리지 않아 상한에 닿을 일이 없었다. Windows에서는 테스트가 그 소켓의 `SO_SNDBUF`를 0으로 둔다. 상한 로직을 빼면 Linux와 Windows 둘 다에서 여전히 실패한다. README에 Windows의 이 동작을 적었다 (#44)
-
-### Known Issues
-
-- **구독 확인이 취소되거나 시간 초과되면 그 루프의 연결이 수신을 멈춘다(nats-py 2.16.0).** 일반 채널의 첫 `receive`, 루프의 첫 `new_channel`, 루프에 처음 생기는 그룹의 `group_add`가 해당한다. 예외 없이 nats-py `ERROR` 한 줄만 남고, 기본값이면 재접속까지 최대 약 6분이 걸린다. 원인은 nats-py에 있고 상류 수정(nats-io/nats.py#1031)이 릴리스되면 하한을 올린다. 그때까지 README에 임시 안내를 두고, 이 결함을 strict xfail 회귀 테스트로 고정했다 (#41)
+- **구독 확인이 취소되거나 시간 초과되면 그 루프의 연결이 수신을 멈췄다(nats-py 2.16.0 이하).** 일반 채널의 첫 `receive`, 루프의 첫 `new_channel`, 루프에 처음 생기는 그룹의 `group_add`가 PONG을 기다리다 끊기면(호출자 취소, nats-py flush 타임아웃, `publish_deadline`), 늦게 온 PONG에 nats-py `_process_pong`이 `InvalidStateError`를 내고 읽기 루프가 끝났다. 예외 없이 nats-py `ERROR` 한 줄만 남았고, 기본값이면 재접속까지 최대 약 6분이 걸렸다(재현함). 원인은 nats-py에 있고 상류 수정(nats-io/nats.py#1031)은 아직 릴리스되지 않았다. 이제 레이어가 그 수정과 같은 코드로 `Client._process_pong`을 바꾼다. 설치된 nats-py가 2.16.0 이하이고 그 메서드가 2.16.0의 코드 그대로일 때만, 프로세스당 한 번 적용하고 결과를 `channels_nats` 로거 DEBUG에 남긴다. 상류 수정 커밋을 설치하면(버전은 똑같이 2.16.0) 적용하지 않는다. strict xfail이던 회귀 테스트 3건이 통과하고, flush 타임아웃·`publish_deadline` 경로의 테스트를 더했다. 패치를 빼면 다섯 건 모두 실패한다 (#41)
 
 ## [0.10.0] - 2026-09-30
 

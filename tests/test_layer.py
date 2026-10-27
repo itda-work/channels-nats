@@ -1660,6 +1660,8 @@ class _FakeNats:
         self.received = bytearray()  # every byte read, so a test can tell delivered from cut
         self.resume = threading.Event()
         self.wedged = threading.Event()  # set to stop reading at the next read, on demand
+        self.holding_pongs = threading.Event()  # set to owe PINGs their PONGs until release_pongs()
+        self._owed: list[tuple[asyncio.StreamWriter, int]] = []
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -1683,8 +1685,11 @@ class _FakeNats:
             while chunk := await reader.read(1 << 16):
                 self.received += chunk
                 data = tail + chunk
-                for _ in range(data.count(b"PING\r\n")):
-                    writer.write(b"PONG\r\n")
+                pings = data.count(b"PING\r\n")
+                if self.holding_pongs.is_set():
+                    self._owed.append((writer, pings))
+                else:
+                    writer.write(b"PONG\r\n" * pings)
                 tail = data[-5:]
                 if (wedge and b"PING\r\n" in data) or self.wedged.is_set():
                     # From here the broker is wedged until told to resume, and then
@@ -1697,6 +1702,17 @@ class _FakeNats:
             self.open -= 1
             self.ended.append(time.monotonic())
             writer.close()
+
+    def release_pongs(self) -> None:
+        """Answer the PINGs held back since ``holding_pongs`` was set, in order, and stop holding."""
+
+        def release() -> None:
+            self.holding_pongs.clear()
+            for writer, pings in self._owed:
+                writer.write(b"PONG\r\n" * pings)
+            self._owed.clear()
+
+        self._loop.call_soon_threadsafe(release)
 
     def close(self) -> None:
         self.resume.set()
@@ -2226,12 +2242,6 @@ async def test_a_new_channel_that_flush_overtook_does_not_leave_its_subscription
     assert await asyncio.wait_for(layer.receive(channel), 5) == {"type": "test.message"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#41: nats-py 2.16.0 ends its read loop on the PONG of a cancelled flush. "
-    "Fixed upstream by nats-py#1031; once that is released, raise the nats-py floor and remove this mark.",
-)
 @pytest.mark.parametrize("kind", ["plain receive", "first new_channel", "first group_add"])
 async def test_a_cancelled_subscription_confirm_does_not_end_the_connection(make_layer, kind):
     """A confirm cancelled while it waits for its PONG must not stop the connection reading.
@@ -2242,7 +2252,8 @@ async def test_a_cancelled_subscription_confirm_does_not_end_the_connection(make
     no reconnect, no close, one ERROR line. Every later confirm returns without the
     server's answer, so the instance still looks healthy and receives nothing
     (reproduced against a real server, #41). A short ``wait_for`` around a first
-    ``receive`` is one way to get there.
+    ``receive`` is one way to get there. The layer patches ``_process_pong`` with
+    upstream's fix (nats-io/nats.py#1031) where nats-py still has the defect.
 
     The cancel lands only once the confirm stands on a pending PONG, and that is
     checked rather than assumed (see CLAUDE.md, 함정).
@@ -2293,3 +2304,70 @@ async def test_a_cancelled_subscription_confirm_does_not_end_the_connection(make
         for _ in range(2):
             received.append((await asyncio.wait_for(worker.receive(after), 3))["type"])
     assert sorted(received) == ["direct", "group"], f"the connection stopped reading after the cancel ({received})"
+
+
+async def _pong_held_past(layer: NatsChannelLayer, server: _FakeNats, give_up):
+    """Hold the server's PONGs, let ``give_up`` abandon a flush, then send them.
+
+    Returns the client once the PONG for the abandoned flush has been read, or the
+    read loop has stopped trying.
+    """
+    client = await layer._client()
+    server.holding_pongs.set()
+    abandoned = len(client._pongs)
+    await give_up(client)
+    assert len(client._pongs) > abandoned and client._pongs[-1].done(), "the flush did not leave a done future"
+    server.release_pongs()
+    for _ in range(500):
+        if not client._pongs or client._reading_task.done():
+            break
+        await asyncio.sleep(0.01)
+    return client
+
+
+async def test_a_flush_timed_out_by_nats_py_does_not_end_the_connection():
+    """Path 2 of #41: nats-py's own flush ``timeout`` cancels the future it waits on.
+
+    The layer's flushes take nats-py's default of 10 s, so the timeout is shortened
+    by calling ``Client.flush()`` directly; the future, the cancel and the late
+    PONG are the same.
+    """
+    server = _FakeNats()
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}", publish_deadline=None)
+    try:
+
+        async def time_out(client) -> None:
+            with pytest.raises(FlushTimeoutError):
+                await client.flush(timeout=0.2)
+
+        client = await _pong_held_past(layer, server, time_out)
+        assert not client._reading_task.done(), "the read loop ended on the PONG of a timed-out flush"
+        assert not client._pongs
+        await client.flush(timeout=2)  # answered by its own PONG
+    finally:
+        await layer.close()
+        server.close()
+
+
+async def test_a_confirm_past_publish_deadline_does_not_end_the_connection():
+    """Path 3 of #41: ``publish_deadline`` cancels a confirm waiting on its PONG.
+
+    The deadline fails the call while the read loop is still alive; the loop used
+    to end only when the PONG came afterwards (reproduced against a real server
+    paused past the deadline, #41).
+    """
+    server = _FakeNats()
+    layer = NatsChannelLayer(servers=f"nats://127.0.0.1:{server.port}", publish_deadline=0.2)
+    try:
+
+        async def miss_the_deadline(client) -> None:
+            with pytest.raises(FlushTimeoutError):
+                await layer.new_channel()
+
+        client = await _pong_held_past(layer, server, miss_the_deadline)
+        assert not client._reading_task.done(), "the read loop ended on the PONG of a confirm past the deadline"
+        assert not client._pongs
+        await layer.new_channel()  # the loop's first confirm again, answered this time
+    finally:
+        await layer.close()
+        server.close()

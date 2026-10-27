@@ -16,6 +16,7 @@
 channels_nats/
 ├── __init__.py       NatsChannelLayer 재export
 ├── layer.py          레이어 본체. 이벤트 루프별 연결, 채널별 로컬 mailbox, 그룹당 구독 하나
+├── _nats_patches.py  nats-py 결함의 버전 게이트 몽키패치(#41). 걷어 낼 조건은 각 패치 docstring
 └── serializers.py    msgpack 고정. 형식은 프로세스 간 계약이라 옵션이 아니다
 tests/                nats-server 바이너리를 띄우는 통합 테스트 (NATS_SERVER, PATH, ~/go/bin 순서로 탐색)
 bench/fanout.py       group_send fan-out 지연·처리량. InMemory 레이어와 비교
@@ -52,6 +53,7 @@ scripts/ci-windows-setup.ps1  Windows CI 머신의 도구 준비(멱등)
 - `subscribe` 뒤 `flush()`를 기다려야 서버가 구독을 알고 있다. 이를 빼면 다른 프로세스의 직후 발행을 놓친다. 클러스터에서는 `flush()`도 자기 노드까지만 보장하고 다른 노드로의 전파는 비동기다. 노드를 넘는 테스트는 도착할 때까지 발행을 반복한다(`tests/test_cluster.py`). 그래서 그 테스트들이 확인하는 것은 **eventual reachability**이지 최초 1회 발행의 무손실이 아니다 — 전파 창·노드 장애·재접속 중의 유실은 허용된 동작이다. 통과를 "유실 없음"으로 읽지 않는다.
 - **취소가 nats-py 안에서 사라질 수 있다.** `_flush_pending()`은 `except asyncio.CancelledError: pass`다. 송신 backpressure로 그 지점에 머무는 동안 취소가 오면 삼켜지고, 태스크는 취소되지 않고 **정상 완료된다**(실제 서버로 확인). 레이어 상태는 일관된다 — mailbox는 만들어지고 구독도 붙는다. 잃는 것은 자원이 아니라 취소 신호다. **체류 지점은 둘이고 경로마다 닿는 곳이 다르다.** `publish`는 pending > `pending_size`일 때 강제 flush의 `wait_for`에, `flush()`는 PING을 transport에 직접 쓰므로 flush 큐(1024)가 찼을 때 `_flush_queue.put()`에 선다. 큐는 publish로는 안 차고 subscribe·unsubscribe·ping이 채운다. 둘 다 호출자의 `Task.cancelling()`이 0 → 1로 남아 감지되고(실측, nats-py 기본값), `_keeping_cancellation()`이 되살린다. `subscribe`·`unsubscribe`는 자식 태스크 + shield라 호출자의 취소가 nats-py에 들어가지 않는다. subscribe 경로를 `cancelling()` 0으로 읽었던 측정(#23 라운드 1)은 취소 전에 끝난 태스크를 본 오탐이었고, #19의 같은 관측은 재확인하지 못했다. 정상 disconnect 경로라면 daphne가 1초마다 다시 취소하므로 지연은 유계다. 종료 경로는 다르다: `kill_all_applications`는 한 번만 취소하고 gather한다(#23).
 - **취소 재현은 취소 직전에 태스크가 정말 그 지점에 서 있는지 확인해야 한다.** `done()`이 False인지, `cancel()`이 True를 돌려주는지, await 체인이 예상한 곳인지 — 셋 다 본다. 안 보면 이미 끝난 태스크의 정상 완료를 "삼켜진 취소"로 읽는다. 실제로 그렇게 오탐했고 외부 검토에서 잡혔다(#23).
+- **레이어가 nats-py `Client._process_pong`을 몽키패치한다**(`channels_nats/_nats_patches.py`, #41). nats-py 2.16.0 이하는 취소·시간 초과된 flush의 늦은 PONG에 `InvalidStateError`를 내고 읽기 루프를 끝낸다. 패치는 상류 수정(nats-io/nats.py#1031, 병합 커밋 `c0589b45`)과 같은 코드이고, **버전 ≤ 2.16.0 과 메서드의 `co_names`가 2.16.0 그대로인지를 함께** 본다 — 상류 main을 설치해도 버전은 2.16.0이라 버전만으로는 못 가른다. 첫 `NatsChannelLayer` 생성 때 프로세스당 한 번 적용하고, 결과는 `channels_nats` 로거 DEBUG(범위 안인데 코드가 다르면 WARNING). 취소된 future를 `_pongs`에서 빼는 식으로 바꾸지 않는다 — PING/PONG FIFO 짝이 깨진다(재현함). **걷어 낼 조건:** #1031이 든 nats-py가 릴리스되면 하한을 그 판으로 올리고 모듈째 지운다(2026-10-27 확인: PyPI 최신 2.16.0, 미릴리스).
 - 순서는 **구독 하나 안에서만** 보장된다. 직접 `send` 대 `group_send`도, 서로 다른 두 그룹도 역전된다. 와이어 순서는 옳고 뒤집는 것은 nats-py의 구독별 디스패치다. 고치려면 수신 측 단일 디스패처가 필요하다 — 불가능한 게 아니라 유지 비용 문제다.
 - `uv run`은 매번 프로젝트를 재동기화한다. 반면 venv의 python을 직접 부르면 옛 설치가 남아 `__version__`이 뒤처져 보인다. 배포본 검증은 별도 venv에 `--no-cache --reinstall`로 버전을 못 박아 설치하고, 저장소 밖 디렉터리에서 돌린다(저장소 안에서 돌리면 소스 트리가 설치본을 가린다).
 - 배포 직후 PyPI JSON API는 한동안 옛 버전을 준다. 업로드 로그의 200 OK로 먼저 확인하고, 반영은 폴링해서 본다.

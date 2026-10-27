@@ -74,7 +74,7 @@ from nats.aio.client import Client
 from nats.aio.subscription import Subscription
 from nats.errors import FlushTimeoutError, NoServersError, SlowConsumerError
 
-from . import serializers
+from . import _nats_patches, serializers
 
 log = logging.getLogger("channels_nats")
 
@@ -225,6 +225,9 @@ class NatsChannelLayer(BaseChannelLayer):
         publish_deadline: float | None = 10.0,
     ) -> None:
         super().__init__(expiry=expiry, capacity=capacity, channel_capacity=channel_capacity)
+        # nats-py 2.16.0 and earlier end the read loop on the PONG of a cancelled
+        # flush (#41); patched once per process, only where it is that code.
+        _nats_patches.apply()
         # BaseChannelLayer stores the raw dict, but get_capacity iterates compiled
         # (pattern, capacity) pairs, so every layer has to compile it itself.
         # Channels annotates the attribute as the dict its own get_capacity cannot read.
